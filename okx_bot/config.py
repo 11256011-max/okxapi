@@ -130,6 +130,16 @@ class BotConfig:
     external_context_min_support: Decimal
     fear_greed_mode: str
     fundamental_bias: dict[str, Decimal]
+    add_position_enabled: bool
+    max_position_adds: int
+    add_position_quote_fraction: Decimal
+    add_position_require_profit: bool
+    add_position_min_profit_pct: Decimal
+    add_position_breakout_lookback: int
+    add_position_pullback_ma_period: int
+    add_position_support_lookback: int
+    add_position_support_tolerance_pct: Decimal
+    add_position_volume_multiplier: Decimal
     order_quote_amount: Decimal
     max_quote_per_order: Decimal
     stop_loss_pct: Decimal
@@ -189,6 +199,16 @@ class BotConfig:
             external_context_min_support=env_decimal("EXTERNAL_CONTEXT_MIN_SUPPORT", "-0.35"),
             fear_greed_mode=os.getenv("FEAR_GREED_MODE", "momentum").strip().lower(),
             fundamental_bias=env_score_map("FUNDAMENTAL_BIAS"),
+            add_position_enabled=env_bool("ADD_POSITION_ENABLED", True),
+            max_position_adds=env_int("MAX_POSITION_ADDS", 2),
+            add_position_quote_fraction=env_decimal("ADD_POSITION_QUOTE_FRACTION", "0.5"),
+            add_position_require_profit=env_bool("ADD_POSITION_REQUIRE_PROFIT", True),
+            add_position_min_profit_pct=env_decimal("ADD_POSITION_MIN_PROFIT_PCT", "0.005"),
+            add_position_breakout_lookback=env_int("ADD_POSITION_BREAKOUT_LOOKBACK", 20),
+            add_position_pullback_ma_period=env_int("ADD_POSITION_PULLBACK_MA_PERIOD", 20),
+            add_position_support_lookback=env_int("ADD_POSITION_SUPPORT_LOOKBACK", 20),
+            add_position_support_tolerance_pct=env_decimal("ADD_POSITION_SUPPORT_TOLERANCE_PCT", "0.003"),
+            add_position_volume_multiplier=env_decimal("ADD_POSITION_VOLUME_MULTIPLIER", "1.2"),
             order_quote_amount=env_decimal("ORDER_QUOTE_AMOUNT", "10"),
             max_quote_per_order=env_decimal("MAX_QUOTE_PER_ORDER", "10"),
             stop_loss_pct=env_decimal("STOP_LOSS_PCT", "0.02"),
@@ -253,6 +273,22 @@ class BotConfig:
         for symbol, score in self.fundamental_bias.items():
             if not Decimal("-1") <= score <= Decimal("1"):
                 raise ConfigError(f"FUNDAMENTAL_BIAS for {symbol} must be between -1 and 1, or -100 and 100 percent.")
+        if self.max_position_adds < 0:
+            raise ConfigError("MAX_POSITION_ADDS cannot be negative.")
+        if not Decimal("0") < self.add_position_quote_fraction <= Decimal("1"):
+            raise ConfigError("ADD_POSITION_QUOTE_FRACTION must be between 0 and 1.")
+        if self.add_position_min_profit_pct < 0:
+            raise ConfigError("ADD_POSITION_MIN_PROFIT_PCT cannot be negative.")
+        if self.add_position_breakout_lookback < 2:
+            raise ConfigError("ADD_POSITION_BREAKOUT_LOOKBACK must be at least 2.")
+        if self.add_position_pullback_ma_period < 2:
+            raise ConfigError("ADD_POSITION_PULLBACK_MA_PERIOD must be at least 2.")
+        if self.add_position_support_lookback < 2:
+            raise ConfigError("ADD_POSITION_SUPPORT_LOOKBACK must be at least 2.")
+        if self.add_position_support_tolerance_pct < 0:
+            raise ConfigError("ADD_POSITION_SUPPORT_TOLERANCE_PCT cannot be negative.")
+        if self.add_position_volume_multiplier <= 0:
+            raise ConfigError("ADD_POSITION_VOLUME_MULTIPLIER must be greater than 0.")
         if not self.symbols:
             raise ConfigError("SYMBOLS is required and must include at least one market symbol like BTC/USDT.")
         if any("/" not in symbol for symbol in self.symbols):

@@ -6,7 +6,7 @@ from unittest.mock import patch
 from okx_bot.bot import TradingBot
 from okx_bot.config import BotConfig
 from okx_bot.external_context import ContextSnapshot
-from okx_bot.models import Signal
+from okx_bot.models import Candle, Signal
 from okx_bot.risk import RiskError
 from okx_bot.state import BotState
 
@@ -60,6 +60,53 @@ class FakeExternalContext:
         return self.snapshot
 
 
+def candle(index: int, open_: str, high: str, low: str, close: str, volume: str = "10") -> Candle:
+    return Candle(
+        timestamp=index,
+        open=Decimal(open_),
+        high=Decimal(high),
+        low=Decimal(low),
+        close=Decimal(close),
+        volume=Decimal(volume),
+    )
+
+
+def long_breakout_candles() -> list[Candle]:
+    candles = []
+    for index in range(25):
+        close = Decimal("100") + (Decimal(index) * Decimal("0.2"))
+        candles.append(
+            candle(
+                index,
+                str(close - Decimal("0.1")),
+                str(close + Decimal("0.5")),
+                str(close - Decimal("0.5")),
+                str(close),
+                "10",
+            )
+        )
+    candles.append(candle(25, "106", "111", "105.5", "110", "20"))
+    return candles
+
+
+def long_no_add_candles() -> list[Candle]:
+    candles = []
+    for index in range(25):
+        close = Decimal("100") + (Decimal(index) * Decimal("0.1"))
+        candles.append(
+            candle(
+                index,
+                str(close - Decimal("0.05")),
+                "110",
+                str(close - Decimal("0.5")),
+                str(close),
+                "10",
+            )
+        )
+    candles.append(candle(25, "103.8", "104.4", "103.7", "104", "10"))
+    return candles
+
+
 def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
     env = {
         "MARKET_TYPE": "swap",
@@ -72,6 +119,7 @@ def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
         "DAILY_MAX_LOSS_PCT": "0.06",
         "MAX_LEVERAGE": "10",
         "EXTERNAL_CONTEXT_ENABLED": "false",
+        "ADD_POSITION_ENABLED": "true",
     }
     env.update(extra_env or {})
     with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
@@ -241,6 +289,40 @@ class BotSwapRiskTests(unittest.TestCase):
 
         self.assertEqual(bot.state.get_position_side(symbol), "short")
         self.assertEqual(bot.state.get_position_base(symbol), Decimal("50"))
+
+    def test_same_direction_buy_adds_only_after_profit_and_breakout(self) -> None:
+        bot = make_bot()
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade("buy", Decimal("2"), Decimal("100"), Decimal("200"), "dry-run", symbol=symbol, position_side="long")
+        signal = Signal("buy", "Add long.", Decimal("110"), {}, Decimal("1"))
+
+        bot.buy(symbol, signal, long_breakout_candles())
+
+        self.assertEqual(bot.state.get_position_side(symbol), "long")
+        self.assertEqual(bot.state.get_add_count(symbol), 1)
+        self.assertGreater(bot.state.get_position_base(symbol), Decimal("2"))
+
+    def test_same_direction_buy_keeps_position_when_not_profitable(self) -> None:
+        bot = make_bot()
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade("buy", Decimal("2"), Decimal("100"), Decimal("200"), "dry-run", symbol=symbol, position_side="long")
+        signal = Signal("buy", "Try add long.", Decimal("99"), {}, Decimal("1"))
+
+        bot.buy(symbol, signal, long_breakout_candles())
+
+        self.assertEqual(bot.state.get_add_count(symbol), 0)
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("2"))
+
+    def test_same_direction_buy_keeps_position_without_breakout_or_pullback(self) -> None:
+        bot = make_bot()
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade("buy", Decimal("2"), Decimal("100"), Decimal("200"), "dry-run", symbol=symbol, position_side="long")
+        signal = Signal("buy", "Try add long.", Decimal("104"), {}, Decimal("1"))
+
+        bot.buy(symbol, signal, long_no_add_candles())
+
+        self.assertEqual(bot.state.get_add_count(symbol), 0)
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("2"))
 
 
 if __name__ == "__main__":

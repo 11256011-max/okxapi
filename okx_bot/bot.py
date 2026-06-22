@@ -57,7 +57,7 @@ class TradingBot:
                 signal.indicators,
             )
 
-            self.execute_signal(symbol, signal)
+            self.execute_signal(symbol, signal, candles)
 
         self.state.save(self.config.state_file)
 
@@ -152,42 +152,120 @@ class TradingBot:
         )
         return Signal("hold", reason, signal.price, indicators, signal.confidence)
 
-    def execute_signal(self, symbol: str, signal: Signal) -> None:
+    def execute_signal(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
         if signal.action == "hold":
             return
         if signal.action == "buy":
-            self.buy(symbol, signal)
+            self.buy(symbol, signal, candles)
             return
         if signal.action == "sell":
-            self.sell(symbol, signal)
+            self.sell(symbol, signal, candles)
             return
         raise RuntimeError(f"Unknown signal action: {signal.action}")
 
-    def buy(self, symbol: str, signal: Signal) -> None:
-        self.buy_swap(symbol, signal)
+    def buy(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
+        self.buy_swap(symbol, signal, candles)
 
-    def sell(self, symbol: str, signal: Signal) -> None:
-        self.sell_swap(symbol, signal)
+    def sell(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
+        self.sell_swap(symbol, signal, candles)
 
-    def buy_swap(self, symbol: str, signal: Signal) -> None:
+    def buy_swap(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
         position_side = self.state.get_position_side(symbol)
         if position_side == "short":
             self.close_swap_position(symbol, signal, order_side="buy")
             return
         if position_side == "long":
-            logging.info("Swap buy skipped because %s already has an open long position.", symbol)
+            self.add_to_swap_position_if_allowed(symbol, signal, "long", "buy", candles)
             return
         self.open_swap_position(symbol, signal, position_side="long", order_side="buy")
 
-    def sell_swap(self, symbol: str, signal: Signal) -> None:
+    def sell_swap(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
         position_side = self.state.get_position_side(symbol)
         if position_side == "long":
             self.close_swap_position(symbol, signal, order_side="sell")
             return
         if position_side == "short":
-            logging.info("Swap sell skipped because %s already has an open short position.", symbol)
+            self.add_to_swap_position_if_allowed(symbol, signal, "short", "sell", candles)
             return
         self.open_swap_position(symbol, signal, position_side="short", order_side="sell")
+
+    def add_to_swap_position_if_allowed(
+        self,
+        symbol: str,
+        signal: Signal,
+        position_side: str,
+        order_side: str,
+        candles: list[Candle] | None,
+    ) -> None:
+        allowed, reason, indicators = self.evaluate_add_position(symbol, position_side, signal, candles)
+        if not allowed:
+            logging.info("Swap add skipped for %s %s: %s Keeping existing position.", symbol, position_side, reason)
+            return
+
+        add_signal = Signal(
+            signal.action,
+            f"{signal.reason} Add position approved: {reason}",
+            signal.price,
+            {**signal.indicators, **indicators},
+            signal.confidence,
+        )
+        self.open_swap_position(
+            symbol,
+            add_signal,
+            position_side=position_side,
+            order_side=order_side,
+            size_multiplier=self.config.add_position_quote_fraction,
+            action_label="add",
+        )
+
+    def evaluate_add_position(
+        self,
+        symbol: str,
+        position_side: str,
+        signal: Signal,
+        candles: list[Candle] | None,
+    ) -> tuple[bool, str, dict[str, float]]:
+        indicators: dict[str, float] = {
+            "add_count": float(self.state.get_add_count(symbol)),
+        }
+        if not self.config.add_position_enabled:
+            return False, "ADD_POSITION_ENABLED=false.", indicators
+        if self.state.get_add_count(symbol) >= self.config.max_position_adds:
+            return False, f"max add count reached ({self.config.max_position_adds}).", indicators
+        if candles is None:
+            return False, "no candle context for add rules.", indicators
+
+        minimum_candles = max(
+            self.config.add_position_breakout_lookback,
+            self.config.add_position_pullback_ma_period + 1,
+            self.config.add_position_support_lookback,
+        ) + 1
+        if len(candles) < minimum_candles:
+            return False, f"not enough candles for add rules ({len(candles)} < {minimum_candles}).", indicators
+
+        profit_pct = self.position_profit_pct(symbol, signal.price)
+        indicators["position_profit_pct"] = float(profit_pct)
+        if self.config.add_position_require_profit and profit_pct < self.config.add_position_min_profit_pct:
+            return (
+                False,
+                f"position profit {self.format_percent(profit_pct)} below add threshold {self.format_percent(self.config.add_position_min_profit_pct)}.",
+                indicators,
+            )
+
+        trend_clear, trend_indicators = self.add_position_trend_clear(candles, position_side)
+        breakout, breakout_indicators = self.add_position_breakout(candles, position_side)
+        pullback, pullback_indicators = self.add_position_pullback(candles, position_side)
+        indicators.update(trend_indicators)
+        indicators.update(breakout_indicators)
+        indicators.update(pullback_indicators)
+
+        if not trend_clear:
+            return False, "trend is not clear enough for pyramiding.", indicators
+        if breakout:
+            return True, "trend breakout with volume confirmed.", indicators
+        if pullback:
+            return True, "pullback support or moving-average bounce confirmed.", indicators
+        return False, "no breakout or pullback support confirmation.", indicators
 
     def open_swap_position(
         self,
@@ -195,9 +273,11 @@ class TradingBot:
         signal: Signal,
         position_side: str,
         order_side: str,
+        size_multiplier: Decimal = Decimal("1"),
+        action_label: str = "open",
     ) -> None:
         try:
-            plan = self.build_swap_position_plan(symbol, signal.price)
+            plan = self.build_swap_position_plan(symbol, signal.price, size_multiplier=size_multiplier)
             self.assert_daily_loss_limit_not_hit(plan.equity)
         except RiskError as exc:
             logging.warning("Swap %s blocked by risk manager: %s", order_side, exc)
@@ -207,7 +287,8 @@ class TradingBot:
 
         if self.config.dry_run:
             logging.info(
-                "[DRY RUN] Would open %s %s: contracts=%s notional=%s margin_budget=%s leverage=%sx risk_amount=%s TP=%s SL=%s.",
+                "[DRY RUN] Would %s %s %s: contracts=%s notional=%s margin_budget=%s leverage=%sx risk_amount=%s TP=%s SL=%s.",
+                action_label,
                 symbol,
                 position_side,
                 plan.amount_contracts,
@@ -255,7 +336,7 @@ class TradingBot:
             symbol=symbol,
             position_side=position_side,
         )
-        logging.info("Swap %s submitted with attached TP/SL: %s", position_side, order)
+        logging.info("Swap %s %s submitted with attached TP/SL: %s", action_label, position_side, order)
 
     def close_swap_position(self, symbol: str, signal: Signal, order_side: str) -> None:
         position_side = self.state.get_position_side(symbol)
@@ -315,17 +396,25 @@ class TradingBot:
         )
         logging.info("Swap %s close submitted: %s", position_side, order)
 
-    def build_swap_position_plan(self, symbol: str, entry_price: Decimal) -> SwapPositionPlan:
+    def build_swap_position_plan(
+        self,
+        symbol: str,
+        entry_price: Decimal,
+        size_multiplier: Decimal = Decimal("1"),
+    ) -> SwapPositionPlan:
         if entry_price <= 0:
             raise RiskError("Entry price must be greater than 0.")
+        if size_multiplier <= 0:
+            raise RiskError("Position size multiplier must be greater than 0.")
 
         equity = self.fetch_account_equity()
         if equity <= 0:
             raise RiskError("Account equity is unavailable or zero.")
 
-        risk_amount = equity * self.config.risk_per_trade_pct
+        risk_amount = equity * self.config.risk_per_trade_pct * size_multiplier
         max_notional_by_risk = risk_amount / self.config.stop_loss_pct
-        margin_budget = min(self.config.order_quote_amount, self.config.max_quote_per_order, max_notional_by_risk)
+        order_quote_amount = self.config.order_quote_amount * size_multiplier
+        margin_budget = min(order_quote_amount, self.config.max_quote_per_order, max_notional_by_risk)
         if margin_budget <= 0:
             raise RiskError("Margin budget is zero.")
 
@@ -446,6 +535,78 @@ class TradingBot:
                 return Decimal(str(value))
         return Decimal("0")
 
+    def position_profit_pct(self, symbol: str, current_price: Decimal) -> Decimal:
+        entry_price = self.state.get_entry_price(symbol)
+        position_side = self.state.get_position_side(symbol)
+        if entry_price <= 0:
+            return Decimal("0")
+        if position_side == "short":
+            return (entry_price - current_price) / entry_price
+        return (current_price - entry_price) / entry_price
+
+    def add_position_trend_clear(self, candles: list[Candle], position_side: str) -> tuple[bool, dict[str, float]]:
+        period = self.config.add_position_pullback_ma_period
+        latest = candles[-1]
+        current_ma = self.average_decimal([candle.close for candle in candles[-period:]])
+        previous_ma = self.average_decimal([candle.close for candle in candles[-period - 1 : -1]])
+        if position_side == "short":
+            trend_clear = latest.close < current_ma and current_ma <= previous_ma
+        else:
+            trend_clear = latest.close > current_ma and current_ma >= previous_ma
+        return trend_clear, {
+            "add_trend_clear": 1.0 if trend_clear else 0.0,
+            "add_ma": float(current_ma),
+            "add_previous_ma": float(previous_ma),
+        }
+
+    def add_position_breakout(self, candles: list[Candle], position_side: str) -> tuple[bool, dict[str, float]]:
+        lookback = self.config.add_position_breakout_lookback
+        latest = candles[-1]
+        previous = candles[-lookback - 1 : -1]
+        avg_volume = self.average_decimal([candle.volume for candle in previous])
+        volume_ok = latest.volume >= avg_volume * self.config.add_position_volume_multiplier if avg_volume > 0 else latest.volume > 0
+
+        if position_side == "short":
+            level = min(candle.low for candle in previous)
+            breakout = latest.close < level and volume_ok
+        else:
+            level = max(candle.high for candle in previous)
+            breakout = latest.close > level and volume_ok
+
+        return breakout, {
+            "add_breakout": 1.0 if breakout else 0.0,
+            "add_breakout_level": float(level),
+            "add_volume_ok": 1.0 if volume_ok else 0.0,
+            "add_avg_volume": float(avg_volume),
+        }
+
+    def add_position_pullback(self, candles: list[Candle], position_side: str) -> tuple[bool, dict[str, float]]:
+        ma_period = self.config.add_position_pullback_ma_period
+        support_lookback = self.config.add_position_support_lookback
+        tolerance = self.config.add_position_support_tolerance_pct
+        latest = candles[-1]
+        previous = candles[-support_lookback - 1 : -1]
+        current_ma = self.average_decimal([candle.close for candle in candles[-ma_period:]])
+
+        if position_side == "short":
+            resistance = max(candle.high for candle in previous)
+            ma_bounce = latest.high >= current_ma * (Decimal("1") - tolerance) and latest.close <= current_ma and latest.close <= latest.open
+            support_bounce = latest.high >= resistance * (Decimal("1") - tolerance) and latest.close <= resistance and latest.close <= latest.open
+            level = resistance
+        else:
+            support = min(candle.low for candle in previous)
+            ma_bounce = latest.low <= current_ma * (Decimal("1") + tolerance) and latest.close >= current_ma and latest.close >= latest.open
+            support_bounce = latest.low <= support * (Decimal("1") + tolerance) and latest.close >= support and latest.close >= latest.open
+            level = support
+
+        pullback = ma_bounce or support_bounce
+        return pullback, {
+            "add_pullback": 1.0 if pullback else 0.0,
+            "add_ma_bounce": 1.0 if ma_bounce else 0.0,
+            "add_support_bounce": 1.0 if support_bounce else 0.0,
+            "add_support_level": float(level),
+        }
+
     def close_action_for_symbol(self, symbol: str) -> str:
         return "buy" if self.state.get_position_side(symbol) == "short" else "sell"
 
@@ -497,6 +658,12 @@ class TradingBot:
         return rounded if value == Decimal(rounded) else rounded + 1
 
     @staticmethod
+    def average_decimal(values: list[Decimal]) -> Decimal:
+        if not values:
+            return Decimal("0")
+        return sum(values, Decimal("0")) / Decimal(len(values))
+
+    @staticmethod
     def clamp_decimal(value: Decimal) -> Decimal:
         return max(Decimal("0"), min(Decimal("1"), value))
 
@@ -507,4 +674,8 @@ class TradingBot:
 
     @staticmethod
     def format_confidence(value: Decimal) -> str:
+        return f"{(value * Decimal('100')).quantize(Decimal('0.01'))}%"
+
+    @staticmethod
+    def format_percent(value: Decimal) -> str:
         return f"{(value * Decimal('100')).quantize(Decimal('0.01'))}%"

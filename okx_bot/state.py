@@ -17,6 +17,7 @@ class SymbolPosition:
     position_base: Decimal = Decimal("0")
     entry_price: Decimal = Decimal("0")
     side: str | None = None
+    add_count: int = 0
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any] | None) -> "SymbolPosition":
@@ -25,6 +26,7 @@ class SymbolPosition:
             position_base=Decimal(str(raw.get("position_base", "0"))),
             entry_price=Decimal(str(raw.get("entry_price", "0"))),
             side=raw.get("side") or ("long" if Decimal(str(raw.get("position_base", "0"))) > 0 else None),
+            add_count=int(raw.get("add_count", 0) or 0),
         )
 
     def to_json(self) -> dict[str, str | None]:
@@ -32,6 +34,7 @@ class SymbolPosition:
             "position_base": str(self.position_base),
             "entry_price": str(self.entry_price),
             "side": self.side,
+            "add_count": str(self.add_count),
         }
 
 
@@ -125,6 +128,9 @@ class BotState:
     def get_position_side(self, symbol: str | None = None) -> str | None:
         return self.ensure_symbol(symbol).side
 
+    def get_add_count(self, symbol: str | None = None) -> int:
+        return self.ensure_symbol(symbol).add_count
+
     def record_trade(
         self,
         side: str,
@@ -189,6 +195,7 @@ class BotState:
         amount_base: Decimal,
         price: Decimal,
     ) -> None:
+        is_add = position.position_base > 0 and position.side == side
         new_total_base = position.position_base + amount_base
         if new_total_base > 0:
             previous_cost = position.position_base * position.entry_price
@@ -196,9 +203,11 @@ class BotState:
             position.entry_price = (previous_cost + new_cost) / new_total_base
         position.position_base = new_total_base
         position.side = side
+        position.add_count = position.add_count + 1 if is_add else 0
 
     def clear_symbol_position(self, symbol: str | None = None) -> None:
         position = self.ensure_symbol(symbol)
         position.position_base = Decimal("0")
         position.entry_price = Decimal("0")
         position.side = None
+        position.add_count = 0

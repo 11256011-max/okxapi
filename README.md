@@ -223,6 +223,40 @@ EXTERNAL_CONTEXT_MIN_SUPPORT=-0.35
 
 啟用後，log 的 `indicators` 會出現 `external_context_score`、`newsapi_score`、`gdelt_score`、`fear_greed_score`、`fundamental_score` 等欄位。
 
+## 加倉規則
+
+當已有同方向倉位時，新的同方向 `buy` / `sell` 訊號不會直接加倉。bot 會先檢查以下條件：
+
+- 原有部位已達設定浮盈。
+- 均線方向與價格位置支持目前趨勢。
+- 出現放量突破前高 / 前低，或回踩均線、支撐 / 壓力後反彈。
+- 尚未超過最大加倉次數。
+
+若條件沒有全部達成，bot 只保留原有倉位，不會加倉。
+
+```env
+ADD_POSITION_ENABLED=true
+MAX_POSITION_ADDS=2
+ADD_POSITION_QUOTE_FRACTION=0.5
+ADD_POSITION_REQUIRE_PROFIT=true
+ADD_POSITION_MIN_PROFIT_PCT=0.005
+ADD_POSITION_BREAKOUT_LOOKBACK=20
+ADD_POSITION_PULLBACK_MA_PERIOD=20
+ADD_POSITION_SUPPORT_LOOKBACK=20
+ADD_POSITION_SUPPORT_TOLERANCE_PCT=0.003
+ADD_POSITION_VOLUME_MULTIPLIER=1.2
+```
+
+- `MAX_POSITION_ADDS`：同一倉位最多加倉次數。
+- `ADD_POSITION_QUOTE_FRACTION`：加倉單使用原本 `ORDER_QUOTE_AMOUNT` 的比例。
+- `ADD_POSITION_REQUIRE_PROFIT`：是否要求原倉已有浮盈才可加倉；若要做回調拉低均價可設 `false`，但風險較高。
+- `ADD_POSITION_MIN_PROFIT_PCT`：原倉最低浮盈，`0.005` 代表 0.5%。
+- `ADD_POSITION_BREAKOUT_LOOKBACK`：判斷突破前高 / 前低的 K 線數。
+- `ADD_POSITION_PULLBACK_MA_PERIOD`：回踩均線使用的均線週期。
+- `ADD_POSITION_SUPPORT_LOOKBACK`：判斷支撐 / 壓力的 K 線數。
+- `ADD_POSITION_SUPPORT_TOLERANCE_PCT`：接近支撐 / 壓力或均線的容許範圍。
+- `ADD_POSITION_VOLUME_MULTIPLIER`：突破時成交量至少要高於均量幾倍。
+
 ## 風控
 
 ```env
