@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import BotConfig
 from .exchange import create_exchange
+from .external_context import ExternalContextService
 from .models import Candle, Signal
 from .risk import RiskError, RiskManager
 from .state import BotState
@@ -29,6 +30,7 @@ class TradingBot:
         self.exchange = create_exchange(config)
         self.strategy = create_strategy(config)
         self.risk = RiskManager(config)
+        self.external_context = ExternalContextService(config) if config.external_context_enabled else None
         self.state = BotState.load(config.state_file, default_symbol=self.config.symbols[0])
 
     def run_once(self) -> None:
@@ -41,6 +43,7 @@ class TradingBot:
                 continue
 
             signal = self.strategy.generate(candles)
+            signal = self.apply_external_context_filter(symbol, signal)
             signal = self.apply_signal_confidence_gate(signal)
             signal = self.apply_position_risk(symbol, signal)
 
@@ -87,6 +90,53 @@ class TradingBot:
         if self.risk.take_profit_hit(self.state, symbol, signal.price):
             return Signal(self.close_action_for_symbol(symbol), "Take profit hit.", signal.price, signal.indicators, Decimal("1"))
         return signal
+
+    def apply_external_context_filter(self, symbol: str, signal: Signal) -> Signal:
+        if self.external_context is None:
+            return signal
+
+        snapshot = self.external_context.evaluate(symbol)
+        indicators = {
+            **signal.indicators,
+            "external_context_score": float(snapshot.combined_score),
+            "external_context_sources": float(snapshot.sources_used),
+        }
+        self.add_optional_indicator(indicators, "newsapi_score", snapshot.newsapi_score)
+        self.add_optional_indicator(indicators, "gdelt_score", snapshot.gdelt_score)
+        self.add_optional_indicator(indicators, "fear_greed_score", snapshot.fear_greed_score)
+        self.add_optional_indicator(indicators, "fundamental_score", snapshot.fundamental_score)
+
+        if signal.action not in {"buy", "sell"}:
+            reason = (
+                f"{signal.reason} External context score="
+                f"{snapshot.combined_score.quantize(Decimal('0.01'))}, sources={snapshot.sources_used}."
+            )
+            return Signal(signal.action, reason, signal.price, indicators, signal.confidence)
+
+        if snapshot.sources_used <= 0:
+            reason = f"{signal.reason} External context unavailable; keeping strategy signal unchanged."
+            return Signal(signal.action, reason, signal.price, indicators, signal.confidence)
+
+        direction = Decimal("1") if signal.action == "buy" else Decimal("-1")
+        directional_support = snapshot.combined_score * direction
+        indicators["external_context_support"] = float(directional_support)
+        adjusted_confidence = self.clamp_decimal(
+            signal.confidence + (directional_support * self.config.external_context_max_confidence_adjustment)
+        )
+
+        if directional_support < self.config.external_context_min_support:
+            reason = (
+                f"{signal.action.upper()} blocked by external context support "
+                f"{directional_support.quantize(Decimal('0.01'))}. {signal.reason}"
+            )
+            return Signal("hold", reason, signal.price, indicators, adjusted_confidence)
+
+        reason = (
+            f"{signal.reason} External context support="
+            f"{directional_support.quantize(Decimal('0.01'))}, confidence adjusted to "
+            f"{self.format_confidence(adjusted_confidence)}."
+        )
+        return Signal(signal.action, reason, signal.price, indicators, adjusted_confidence)
 
     def apply_signal_confidence_gate(self, signal: Signal) -> Signal:
         if signal.action not in {"buy", "sell"}:
@@ -445,6 +495,15 @@ class TradingBot:
     def ceil_decimal(value: Decimal) -> int:
         rounded = int(value)
         return rounded if value == Decimal(rounded) else rounded + 1
+
+    @staticmethod
+    def clamp_decimal(value: Decimal) -> Decimal:
+        return max(Decimal("0"), min(Decimal("1"), value))
+
+    @staticmethod
+    def add_optional_indicator(indicators: dict[str, float], key: str, value: Decimal | None) -> None:
+        if value is not None:
+            indicators[key] = float(value)
 
     @staticmethod
     def format_confidence(value: Decimal) -> str:

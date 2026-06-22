@@ -49,6 +49,35 @@ def env_probability(name: str, default: str) -> Decimal:
     return value
 
 
+def parse_score_value(name: str, raw: str) -> Decimal:
+    try:
+        value = Decimal(str(raw).strip())
+    except InvalidOperation as exc:
+        raise ConfigError(f"{name} values must be decimal numbers") from exc
+    if abs(value) > Decimal("1") and abs(value) <= Decimal("100"):
+        return value / Decimal("100")
+    return value
+
+
+def env_score_map(name: str) -> dict[str, Decimal]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+
+    values: dict[str, Decimal] = {}
+    for item in raw.split(","):
+        if not item.strip():
+            continue
+        if ":" not in item:
+            raise ConfigError(f"{name} entries must look like BTC:0.2")
+        key, value = item.split(":", 1)
+        key = key.strip().upper()
+        if not key:
+            raise ConfigError(f"{name} contains an empty symbol key")
+        values[key] = parse_score_value(name, value)
+    return values
+
+
 def normalize_symbol(symbol: str, market_type: str) -> str:
     if market_type == "swap" and ":" not in symbol:
         base_quote = symbol.split("/")
@@ -87,6 +116,20 @@ class BotConfig:
     smc_zone_tolerance_pct: Decimal
     smc_min_displacement_pct: Decimal
     smc_require_fvg: bool
+    external_context_enabled: bool
+    newsapi_enabled: bool
+    gdelt_enabled: bool
+    fear_greed_enabled: bool
+    fundamental_context_enabled: bool
+    newsapi_api_key: str
+    newsapi_page_size: int
+    external_context_lookback_hours: int
+    external_context_cache_seconds: int
+    external_context_timeout_seconds: int
+    external_context_max_confidence_adjustment: Decimal
+    external_context_min_support: Decimal
+    fear_greed_mode: str
+    fundamental_bias: dict[str, Decimal]
     order_quote_amount: Decimal
     max_quote_per_order: Decimal
     stop_loss_pct: Decimal
@@ -132,6 +175,20 @@ class BotConfig:
             smc_zone_tolerance_pct=env_decimal("SMC_ZONE_TOLERANCE_PCT", "0.003"),
             smc_min_displacement_pct=env_decimal("SMC_MIN_DISPLACEMENT_PCT", "0.002"),
             smc_require_fvg=env_bool("SMC_REQUIRE_FVG", False),
+            external_context_enabled=env_bool("EXTERNAL_CONTEXT_ENABLED", True),
+            newsapi_enabled=env_bool("NEWSAPI_ENABLED", True),
+            gdelt_enabled=env_bool("GDELT_ENABLED", True),
+            fear_greed_enabled=env_bool("FEAR_GREED_ENABLED", True),
+            fundamental_context_enabled=env_bool("FUNDAMENTAL_CONTEXT_ENABLED", True),
+            newsapi_api_key=os.getenv("NEWSAPI_API_KEY", "").strip(),
+            newsapi_page_size=env_int("NEWSAPI_PAGE_SIZE", 20),
+            external_context_lookback_hours=env_int("EXTERNAL_CONTEXT_LOOKBACK_HOURS", 24),
+            external_context_cache_seconds=env_int("EXTERNAL_CONTEXT_CACHE_SECONDS", 300),
+            external_context_timeout_seconds=env_int("EXTERNAL_CONTEXT_TIMEOUT_SECONDS", 6),
+            external_context_max_confidence_adjustment=env_probability("EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT", "0.15"),
+            external_context_min_support=env_decimal("EXTERNAL_CONTEXT_MIN_SUPPORT", "-0.35"),
+            fear_greed_mode=os.getenv("FEAR_GREED_MODE", "momentum").strip().lower(),
+            fundamental_bias=env_score_map("FUNDAMENTAL_BIAS"),
             order_quote_amount=env_decimal("ORDER_QUOTE_AMOUNT", "10"),
             max_quote_per_order=env_decimal("MAX_QUOTE_PER_ORDER", "10"),
             stop_loss_pct=env_decimal("STOP_LOSS_PCT", "0.02"),
@@ -179,6 +236,23 @@ class BotConfig:
             minimum_smc_candles = (self.smc_swing_lookback * 2) + self.smc_zone_lookback + 5
             if self.candle_limit < minimum_smc_candles:
                 raise ConfigError(f"CANDLE_LIMIT must be at least {minimum_smc_candles} for SMC.")
+        if self.newsapi_page_size < 1 or self.newsapi_page_size > 100:
+            raise ConfigError("NEWSAPI_PAGE_SIZE must be between 1 and 100.")
+        if self.external_context_lookback_hours < 1:
+            raise ConfigError("EXTERNAL_CONTEXT_LOOKBACK_HOURS must be at least 1.")
+        if self.external_context_cache_seconds < 0:
+            raise ConfigError("EXTERNAL_CONTEXT_CACHE_SECONDS cannot be negative.")
+        if self.external_context_timeout_seconds < 1:
+            raise ConfigError("EXTERNAL_CONTEXT_TIMEOUT_SECONDS must be at least 1.")
+        if not Decimal("0") <= self.external_context_max_confidence_adjustment <= Decimal("1"):
+            raise ConfigError("EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT must be between 0 and 1.")
+        if not Decimal("-1") <= self.external_context_min_support <= Decimal("1"):
+            raise ConfigError("EXTERNAL_CONTEXT_MIN_SUPPORT must be between -1 and 1.")
+        if self.fear_greed_mode not in {"momentum", "contrarian"}:
+            raise ConfigError("FEAR_GREED_MODE must be momentum or contrarian.")
+        for symbol, score in self.fundamental_bias.items():
+            if not Decimal("-1") <= score <= Decimal("1"):
+                raise ConfigError(f"FUNDAMENTAL_BIAS for {symbol} must be between -1 and 1, or -100 and 100 percent.")
         if not self.symbols:
             raise ConfigError("SYMBOLS is required and must include at least one market symbol like BTC/USDT.")
         if any("/" not in symbol for symbol in self.symbols):

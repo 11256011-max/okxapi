@@ -45,6 +45,12 @@ class ConfigTests(unittest.TestCase):
             config.validate()
             self.assertEqual(str(config.signal_confidence_threshold), "0.8")
 
+    def test_external_context_cache_defaults_to_five_minutes(self) -> None:
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {}, clear=True):
+            config = BotConfig.from_env()
+            config.validate()
+            self.assertEqual(config.external_context_cache_seconds, 300)
+
 
 if __name__ == "__main__":
     unittest.main()

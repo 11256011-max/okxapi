@@ -185,6 +185,44 @@ SMC_REQUIRE_FVG=false
 - `SMC_MIN_DISPLACEMENT_PCT`：突破要至少有多少百分比位移才算有效。
 - `SMC_REQUIRE_FVG`：是否要求 bullish FVG 才能買入。
 
+## 外部資訊濾網
+
+外部資訊濾網會在策略產生 `buy` / `sell` 後執行。它不會自己產生交易訊號，只會調整策略訊號的 `confidence`，或在外部資訊明顯反向時把訊號改成 `hold`。
+
+支援來源：
+
+- NewsAPI：用 `/v2/everything` 搜尋近幾小時的新聞標題與摘要。
+- GDELT：用 DOC 2.0 `timelinetone` 取得新聞 tone。
+- Crypto Fear & Greed Index：用 Alternative.me `/fng/` 取得市場情緒。
+- 基本面偏向：你手動設定每個幣的偏多或偏空分數。
+
+設定：
+
+```env
+EXTERNAL_CONTEXT_ENABLED=true
+NEWSAPI_ENABLED=true
+NEWSAPI_API_KEY=
+NEWSAPI_PAGE_SIZE=20
+GDELT_ENABLED=true
+FEAR_GREED_ENABLED=true
+FEAR_GREED_MODE=momentum
+FUNDAMENTAL_CONTEXT_ENABLED=true
+FUNDAMENTAL_BIAS=BTC:0.2,ETH:0.1,SOL:-0.1
+EXTERNAL_CONTEXT_LOOKBACK_HOURS=24
+EXTERNAL_CONTEXT_CACHE_SECONDS=300
+EXTERNAL_CONTEXT_TIMEOUT_SECONDS=6
+EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT=0.15
+EXTERNAL_CONTEXT_MIN_SUPPORT=-0.35
+```
+
+- `EXTERNAL_CONTEXT_CACHE_SECONDS=300`：同一幣種每 5 分鐘才重新抓一次外部資料。
+- `FEAR_GREED_MODE=momentum`：貪婪偏多、恐慌偏空；若要反向解讀可設 `contrarian`。
+- `FUNDAMENTAL_BIAS`：正數偏多，負數偏空，可用 `-1..1` 或 `-100..100`。
+- `EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT`：外部資訊最多調整多少信心。
+- `EXTERNAL_CONTEXT_MIN_SUPPORT`：外部資訊對該方向低於這個值時擋單。
+
+啟用後，log 的 `indicators` 會出現 `external_context_score`、`newsapi_score`、`gdelt_score`、`fear_greed_score`、`fundamental_score` 等欄位。
+
 ## 風控
 
 ```env
@@ -245,3 +283,6 @@ TAKE_PROFIT_PCT=0.04 -> 止盈觸發價 61440
 - OKX API Docs：https://www.okx.com/docs-v5/en/
 - CCXT OKX Docs：https://docs.ccxt.com/docs/exchanges/okx
 - CCXT Sandbox Manual：https://github.com/ccxt/ccxt/wiki/manual#testnets-and-sandbox-environments
+- NewsAPI Everything：https://newsapi.org/docs/endpoints/everything
+- GDELT DOC 2.0：https://blog.gdeltproject.org/gdelt-doc-2-0-api-debuts/
+- Alternative.me Fear & Greed：https://alternative.me/crypto/fear-and-greed-index/

@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from okx_bot.bot import TradingBot
 from okx_bot.config import BotConfig
+from okx_bot.external_context import ContextSnapshot
 from okx_bot.models import Signal
 from okx_bot.risk import RiskError
 from okx_bot.state import BotState
@@ -51,6 +52,14 @@ class FakeExchange:
         return order
 
 
+class FakeExternalContext:
+    def __init__(self, snapshot: ContextSnapshot) -> None:
+        self.snapshot = snapshot
+
+    def evaluate(self, symbol: str) -> ContextSnapshot:
+        return self.snapshot
+
+
 def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
     env = {
         "MARKET_TYPE": "swap",
@@ -62,6 +71,7 @@ def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
         "RISK_PER_TRADE_PCT": "0.01",
         "DAILY_MAX_LOSS_PCT": "0.06",
         "MAX_LEVERAGE": "10",
+        "EXTERNAL_CONTEXT_ENABLED": "false",
     }
     env.update(extra_env or {})
     with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
@@ -75,6 +85,7 @@ def make_bot(extra_env: dict[str, str] | None = None, equity: str = "10000") -> 
     bot = object.__new__(TradingBot)
     bot.config = config
     bot.exchange = FakeExchange(equity)
+    bot.external_context = None
     bot.state = BotState(default_symbol=config.symbols[0])
     return bot
 
@@ -112,6 +123,58 @@ class BotSignalGateTests(unittest.TestCase):
         gated = TradingBot.apply_signal_confidence_gate(bot_like, signal)
 
         self.assertEqual(gated.action, "buy")
+
+
+class BotExternalContextTests(unittest.TestCase):
+    def test_external_context_increases_aligned_buy_confidence(self) -> None:
+        bot = make_bot({"EXTERNAL_CONTEXT_ENABLED": "true"})
+        bot.external_context = FakeExternalContext(
+            ContextSnapshot(combined_score=Decimal("0.6"), newsapi_score=Decimal("0.6"), sources_used=1)
+        )
+        signal = Signal("buy", "Strategy buy.", Decimal("100"), {}, Decimal("0.70"))
+
+        adjusted = bot.apply_external_context_filter("BTC/USDT:USDT", signal)
+
+        self.assertEqual(adjusted.action, "buy")
+        self.assertGreater(adjusted.confidence, signal.confidence)
+        self.assertEqual(adjusted.indicators["newsapi_score"], 0.6)
+
+    def test_external_context_blocks_contrary_buy_signal(self) -> None:
+        bot = make_bot({"EXTERNAL_CONTEXT_ENABLED": "true", "EXTERNAL_CONTEXT_MIN_SUPPORT": "-0.30"})
+        bot.external_context = FakeExternalContext(
+            ContextSnapshot(combined_score=Decimal("-0.8"), gdelt_score=Decimal("-0.8"), sources_used=1)
+        )
+        signal = Signal("buy", "Strategy buy.", Decimal("100"), {}, Decimal("0.90"))
+
+        adjusted = bot.apply_external_context_filter("BTC/USDT:USDT", signal)
+
+        self.assertEqual(adjusted.action, "hold")
+        self.assertIn("blocked by external context", adjusted.reason)
+
+    def test_external_context_negative_score_supports_sell_signal(self) -> None:
+        bot = make_bot({"EXTERNAL_CONTEXT_ENABLED": "true"})
+        bot.external_context = FakeExternalContext(
+            ContextSnapshot(combined_score=Decimal("-0.4"), fear_greed_score=Decimal("-0.4"), sources_used=1)
+        )
+        signal = Signal("sell", "Strategy sell.", Decimal("100"), {}, Decimal("0.70"))
+
+        adjusted = bot.apply_external_context_filter("BTC/USDT:USDT", signal)
+
+        self.assertEqual(adjusted.action, "sell")
+        self.assertGreater(adjusted.confidence, signal.confidence)
+
+    def test_external_context_is_logged_for_hold_signal(self) -> None:
+        bot = make_bot({"EXTERNAL_CONTEXT_ENABLED": "true"})
+        bot.external_context = FakeExternalContext(
+            ContextSnapshot(combined_score=Decimal("0.2"), gdelt_score=Decimal("0.2"), sources_used=1)
+        )
+        signal = Signal("hold", "No setup.", Decimal("100"), {}, Decimal("0"))
+
+        adjusted = bot.apply_external_context_filter("BTC/USDT:USDT", signal)
+
+        self.assertEqual(adjusted.action, "hold")
+        self.assertEqual(adjusted.indicators["external_context_score"], 0.2)
+        self.assertIn("External context score", adjusted.reason)
 
 
 class BotSwapRiskTests(unittest.TestCase):
