@@ -32,6 +32,7 @@ class TradingBot:
         self.risk = RiskManager(config)
         self.external_context = ExternalContextService(config) if config.external_context_enabled else None
         self.state = BotState.load(config.state_file, default_symbol=self.config.symbols[0])
+        self._effective_position_mode: str | None = None
 
     def run_once(self) -> None:
         self.state.reset_daily_if_needed()
@@ -98,6 +99,7 @@ class TradingBot:
         snapshot = self.external_context.evaluate(symbol)
         indicators = {
             **signal.indicators,
+            "strategy_confidence": float(signal.confidence),
             "external_context_score": float(snapshot.combined_score),
             "external_context_sources": float(snapshot.sources_used),
         }
@@ -125,12 +127,14 @@ class TradingBot:
         )
 
         if directional_support < self.config.external_context_min_support:
+            indicators["confidence"] = float(adjusted_confidence)
             reason = (
                 f"{signal.action.upper()} blocked by external context support "
                 f"{directional_support.quantize(Decimal('0.01'))}. {signal.reason}"
             )
             return Signal("hold", reason, signal.price, indicators, adjusted_confidence)
 
+        indicators["confidence"] = float(adjusted_confidence)
         reason = (
             f"{signal.reason} External context support="
             f"{directional_support.quantize(Decimal('0.01'))}, confidence adjusted to "
@@ -488,8 +492,11 @@ class TradingBot:
 
     def set_swap_leverage(self, symbol: str, leverage: int, position_side: str) -> None:
         params: dict[str, Any] = {"mgnMode": self.config.margin_mode}
-        if self.config.position_mode == "hedge":
+        position_mode = self.effective_position_mode()
+        if position_mode == "hedge":
             params["posSide"] = position_side
+        elif self.config.margin_mode == "isolated":
+            params["posSide"] = "net"
         self.exchange.set_leverage(
             leverage,
             symbol,
@@ -500,8 +507,11 @@ class TradingBot:
         params: dict[str, Any] = {"tdMode": self.config.margin_mode}
         if reduce_only:
             params["reduceOnly"] = True
-        if self.config.position_mode == "hedge" and position_side in {"long", "short"}:
+        position_mode = self.effective_position_mode()
+        if position_mode == "hedge" and position_side in {"long", "short"}:
             params["positionSide"] = position_side
+        elif position_mode == "net":
+            params["positionSide"] = "net"
         return params
 
     def contract_amount_from_notional(self, symbol: str, notional: Decimal, price: Decimal) -> Decimal:
@@ -641,6 +651,38 @@ class TradingBot:
         if self.config.okx_simulated_trading:
             return "okx-simulated"
         return "live"
+
+    def effective_position_mode(self) -> str:
+        configured_mode = self.config.position_mode
+        if configured_mode in {"net", "hedge"} and (self.config.dry_run or not self.config.has_private_credentials):
+            return configured_mode
+
+        cached_mode = getattr(self, "_effective_position_mode", None)
+        if cached_mode in {"net", "hedge"}:
+            return cached_mode
+
+        if self.config.dry_run or not self.config.has_private_credentials:
+            mode = "net" if configured_mode == "auto" else configured_mode
+            self._effective_position_mode = mode
+            return mode
+
+        try:
+            position_mode = self.exchange.fetch_position_mode()
+        except Exception as exc:
+            mode = "net" if configured_mode == "auto" else configured_mode
+            logging.warning("Could not detect OKX position mode; using POSITION_MODE=%s. Error: %s", mode, exc)
+            self._effective_position_mode = mode
+            return mode
+
+        detected_mode = "hedge" if position_mode.get("hedged") else "net"
+        if configured_mode in {"net", "hedge"} and configured_mode != detected_mode:
+            logging.warning(
+                "Configured POSITION_MODE=%s but OKX account reports %s; using OKX account mode to avoid posSide errors.",
+                configured_mode,
+                detected_mode,
+            )
+        self._effective_position_mode = detected_mode
+        return detected_mode
 
     @staticmethod
     def decimal_from_order(order: Any, key: str, fallback: Decimal) -> Decimal:

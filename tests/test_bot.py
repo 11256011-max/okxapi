@@ -12,8 +12,9 @@ from okx_bot.state import BotState
 
 
 class FakeExchange:
-    def __init__(self, equity: str = "10000") -> None:
+    def __init__(self, equity: str = "10000", hedged: bool = False) -> None:
         self.equity = equity
+        self.hedged = hedged
         self.orders = []
         self.leverage_calls = []
 
@@ -32,6 +33,9 @@ class FakeExchange:
             "total": {"USDT": self.equity},
             "free": {"USDT": self.equity},
         }
+
+    def fetch_position_mode(self):
+        return {"hedged": self.hedged}
 
     def set_leverage(self, leverage: int, symbol: str, params=None):
         self.leverage_calls.append((leverage, symbol, params or {}))
@@ -128,13 +132,14 @@ def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
         return config
 
 
-def make_bot(extra_env: dict[str, str] | None = None, equity: str = "10000") -> TradingBot:
+def make_bot(extra_env: dict[str, str] | None = None, equity: str = "10000", hedged: bool = False) -> TradingBot:
     config = make_config(extra_env)
     bot = object.__new__(TradingBot)
     bot.config = config
-    bot.exchange = FakeExchange(equity)
+    bot.exchange = FakeExchange(equity, hedged=hedged)
     bot.external_context = None
     bot.state = BotState(default_symbol=config.symbols[0])
+    bot._effective_position_mode = None
     return bot
 
 
@@ -259,8 +264,29 @@ class BotSwapRiskTests(unittest.TestCase):
 
         self.assertEqual(order["side"], "sell")
         self.assertEqual(order["params"]["tdMode"], "isolated")
+        self.assertEqual(order["params"]["positionSide"], "net")
         self.assertEqual(order["params"]["takeProfit"]["triggerPrice"], 96.0)
         self.assertEqual(order["params"]["stopLoss"]["triggerPrice"], 102.0)
+
+    def test_position_mode_uses_detected_okx_net_mode(self) -> None:
+        bot = make_bot(
+            {"DRY_RUN": "false", "POSITION_MODE": "hedge", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"},
+            hedged=False,
+        )
+
+        params = bot.swap_order_params("short")
+
+        self.assertEqual(params["positionSide"], "net")
+
+    def test_position_mode_uses_detected_okx_hedge_mode(self) -> None:
+        bot = make_bot(
+            {"DRY_RUN": "false", "POSITION_MODE": "net", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"},
+            hedged=True,
+        )
+
+        params = bot.swap_order_params("short")
+
+        self.assertEqual(params["positionSide"], "short")
 
     def test_daily_loss_limit_blocks_new_positions(self) -> None:
         bot = make_bot()

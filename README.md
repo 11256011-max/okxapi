@@ -85,21 +85,17 @@ ENABLE_LIVE_TRADING=true
 
 ## 策略選擇
 
-目前支援兩種策略：
+目前策略已統一為五模組整合版：
 
 ```env
-STRATEGY=ema_rsi
+STRATEGY=combined
 ```
 
-或：
-
-```env
-STRATEGY=smc
-```
+舊的 `STRATEGY=ema_rsi` 或 `STRATEGY=smc` 會自動映射到 `combined`。
 
 ## 訊號符合度門檻
 
-每個策略都會計算 `confidence`，代表目前條件符合策略的程度。只有達到門檻的 `buy` 或 `sell` 訊號才會進入下單流程；低於門檻會自動改成 `hold`。
+策略會計算 `confidence`，代表 order flow、liquidity sweep、anchored VWAP、volume profile、SMC 五個模組統整後的符合度。只有達到門檻的 `buy` 或 `sell` 訊號才會進入下單流程；低於門檻會自動改成 `hold`。
 
 ```env
 SIGNAL_CONFIDENCE_THRESHOLD=0.80
@@ -119,71 +115,51 @@ Signal=hold confidence=74.00% reason=BUY signal blocked because confidence 74.00
 
 停損和停利是風控退出，不會被這個門檻擋住。
 
-## EMA + RSI 策略
+## 整合策略
 
-買入：
+目前只有一個策略：`combined`。舊的 `STRATEGY=ema_rsi` 或 `STRATEGY=smc` 會自動映射到 `combined`，不會再跑舊策略。
 
-- 快速 EMA 上穿慢速 EMA
-- RSI 沒有過熱
+它會把五個模組合併評分：
 
-賣出：
+- `order flow`：用 K 線方向、收盤位置與成交量估算買賣力道。
+- `liquidity sweep`：觀察是否掃過近期高低點後收回。
+- `anchored VWAP`：從近期高點或低點錨定 VWAP，判斷價格是否站回或跌破成本中樞。
+- `volume profile`：估算 POC、value area high、value area low，判斷價格是否突破或守住主要成交區。
+- `SMC`：保留 swing、BOS、FVG、order block 等市場結構概念。
 
-- 快速 EMA 下穿慢速 EMA
-- 或 RSI 達到賣出門檻
-- 或觸發停損 / 停利
-
-設定：
-
-```env
-FAST_EMA=9
-SLOW_EMA=21
-RSI_PERIOD=14
-RSI_BUY_MAX=65
-RSI_SELL_MIN=70
-```
-
-## SMC 策略
-
-SMC 是 Smart Money Concepts 的簡化規則版。`buy` 訊號可開多或平空，`sell` 訊號可開空或平多。
-
-它會觀察：
-
-- Swing high / swing low
-- BOS，也就是 break of structure
-- CHOCH 類似的結構轉弱訊號
-- Bullish order block
-- Bullish fair value gap，可選
-
-買入：
-
-- 出現 bullish BOS 並有足夠位移
-- 或多頭結構成立，價格回踩 bullish order block
-- 如果 `SMC_REQUIRE_FVG=true`，還需要近期有 bullish FVG
-
-賣出：
-
-- 出現 bearish BOS 並有足夠位移
-- 或多頭結構失效
-- 或觸發停損 / 停利
+`confidence` 是以上五個模組加權後的整合分數，不再是單一 SMC 分數。它是訊號強度估算，不是保證勝率；若要知道真實勝率，需要另外做歷史回測。
 
 設定：
 
 ```env
-STRATEGY=smc
-SMC_SWING_LOOKBACK=3
-SMC_ZONE_LOOKBACK=40
-SMC_ZONE_TOLERANCE_PCT=0.003
-SMC_MIN_DISPLACEMENT_PCT=0.002
-SMC_REQUIRE_FVG=false
+STRATEGY=combined
+SIGNAL_CONFIDENCE_THRESHOLD=0.80
+COMBINED_MIN_SCORE=0.80
+COMBINED_MIN_EDGE=0.10
+COMBINED_SWING_LOOKBACK=3
+COMBINED_STRUCTURE_LOOKBACK=40
+COMBINED_ORDER_FLOW_LOOKBACK=20
+COMBINED_AVWAP_LOOKBACK=80
+COMBINED_VOLUME_PROFILE_LOOKBACK=80
+COMBINED_VOLUME_PROFILE_BINS=24
+COMBINED_VALUE_AREA_PCT=0.70
+COMBINED_SWEEP_TOLERANCE_PCT=0.001
+COMBINED_MIN_DISPLACEMENT_PCT=0.002
 ```
 
 參數意思：
 
-- `SMC_SWING_LOOKBACK`：左右各看幾根 K 線確認 swing high / low。
-- `SMC_ZONE_LOOKBACK`：往回找幾根 K 線內的 order block 和 FVG。
-- `SMC_ZONE_TOLERANCE_PCT`：價格接近 order block 的容許範圍。
-- `SMC_MIN_DISPLACEMENT_PCT`：突破要至少有多少百分比位移才算有效。
-- `SMC_REQUIRE_FVG`：是否要求 bullish FVG 才能買入。
+- `COMBINED_MIN_SCORE`：多方或空方整合分數至少要到多少才可能交易，`0.80` 代表 80%。
+- `COMBINED_MIN_EDGE`：多空分數差距至少要多少，避免多空分數太接近還下單。
+- `COMBINED_SWING_LOOKBACK`：左右各看幾根 K 線確認 swing high / low。
+- `COMBINED_STRUCTURE_LOOKBACK`：市場結構、流動性掃點、FVG、order block 的回看 K 線數。
+- `COMBINED_ORDER_FLOW_LOOKBACK`：比較成交量均值的回看 K 線數。
+- `COMBINED_AVWAP_LOOKBACK`：尋找 anchored VWAP 錨點的回看 K 線數。
+- `COMBINED_VOLUME_PROFILE_LOOKBACK`：計算 volume profile 的回看 K 線數。
+- `COMBINED_VOLUME_PROFILE_BINS`：volume profile 分幾個價格區間。
+- `COMBINED_VALUE_AREA_PCT`：value area 覆蓋多少成交量。
+- `COMBINED_SWEEP_TOLERANCE_PCT`：判斷掃流動性的容許百分比。
+- `COMBINED_MIN_DISPLACEMENT_PCT`：SMC 突破位移至少要多少才算有效。
 
 ## 外部資訊濾網
 
@@ -264,7 +240,7 @@ ORDER_QUOTE_AMOUNT=10
 MAX_QUOTE_PER_ORDER=10
 MARKET_TYPE=swap
 MARGIN_MODE=isolated
-POSITION_MODE=net
+POSITION_MODE=auto
 RISK_PER_TRADE_PCT=0.01
 DAILY_MAX_LOSS_PCT=0.06
 MAX_LEVERAGE=10
@@ -278,7 +254,7 @@ SELL_FRACTION=1
 - `MAX_QUOTE_PER_ORDER`：單筆最大保證金。
 - `MARKET_TYPE`：固定使用 `swap`，本專案不送現貨單。
 - `MARGIN_MODE`：合約保證金模式，建議先用 `isolated`。
-- `POSITION_MODE`：`net` 是單向持倉；如果 OKX 帳戶是雙向持倉，改成 `hedge`。
+- `POSITION_MODE`：建議用 `auto`，程式會送單前查 OKX 帳戶是單向 `net` 還是雙向 `hedge`，避免 `Parameter posSide error`。
 - `RISK_PER_TRADE_PCT`：單筆最大風險，`0.01` 代表總權益的 1%。
 - `DAILY_MAX_LOSS_PCT`：日內已實現虧損上限，`0.06` 代表總權益的 6%。
 - `MAX_LEVERAGE`：程式自動計算槓桿後的最高上限。

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from .config import BotConfig
-from .indicators import ema, rsi
 from .models import Candle, Signal
 
 
@@ -21,247 +20,322 @@ class PriceZone:
     index: int
 
 
-def create_strategy(config: BotConfig) -> "EmaRsiStrategy | SmcStrategy":
-    if config.strategy == "smc":
-        return SmcStrategy(config)
-    return EmaRsiStrategy(config)
+@dataclass(frozen=True)
+class VolumeProfile:
+    poc: Decimal
+    value_area_low: Decimal
+    value_area_high: Decimal
 
 
-class EmaRsiStrategy:
-    def __init__(self, config: BotConfig) -> None:
-        self.config = config
-
-    def generate(self, candles: list[Candle]) -> Signal:
-        if len(candles) < max(self.config.slow_ema, self.config.rsi_period) + 5:
-            return Signal("hold", "Not enough candles for indicators.", Decimal("0"))
-
-        closes = [float(candle.close) for candle in candles]
-        fast_values = ema(closes, self.config.fast_ema)
-        slow_values = ema(closes, self.config.slow_ema)
-        rsi_values = rsi(closes, self.config.rsi_period)
-
-        current_price = candles[-1].close
-        current_fast = fast_values[-1]
-        current_slow = slow_values[-1]
-        previous_fast = fast_values[-2]
-        previous_slow = slow_values[-2]
-        current_rsi = rsi_values[-1]
-
-        indicators = {
-            "fast_ema": current_fast,
-            "slow_ema": current_slow,
-            "rsi": float(current_rsi) if current_rsi is not None else 0.0,
-        }
-
-        if current_rsi is None:
-            return Signal("hold", "RSI is not ready yet.", current_price, indicators)
-
-        crossed_up = previous_fast <= previous_slow and current_fast > current_slow
-        crossed_down = previous_fast >= previous_slow and current_fast < current_slow
-
-        if crossed_up and Decimal(str(current_rsi)) <= self.config.rsi_buy_max:
-            confidence = self.buy_confidence(current_price, current_fast, current_slow, Decimal(str(current_rsi)))
-            return Signal(
-                "buy",
-                "Fast EMA crossed above slow EMA and RSI is acceptable.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        if crossed_down:
-            confidence = self.sell_confidence(current_price, current_fast, current_slow, Decimal(str(current_rsi)), crossed_down=True)
-            return Signal(
-                "sell",
-                "Fast EMA crossed below slow EMA.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        if Decimal(str(current_rsi)) >= self.config.rsi_sell_min:
-            confidence = self.sell_confidence(current_price, current_fast, current_slow, Decimal(str(current_rsi)), crossed_down=False)
-            return Signal(
-                "sell",
-                "RSI reached the configured sell threshold.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        return Signal("hold", "No entry or exit signal.", current_price, indicators)
-
-    def buy_confidence(self, price: Decimal, fast_ema: float, slow_ema: float, current_rsi: Decimal) -> Decimal:
-        spread_score = self.spread_score(price, fast_ema, slow_ema)
-        rsi_room = max(Decimal("0"), self.config.rsi_buy_max - current_rsi)
-        rsi_score = min(Decimal("1"), rsi_room / Decimal("20"))
-        return self.clamp_confidence(Decimal("0.55") + (spread_score * Decimal("0.25")) + (rsi_score * Decimal("0.20")))
-
-    def sell_confidence(
-        self,
-        price: Decimal,
-        fast_ema: float,
-        slow_ema: float,
-        current_rsi: Decimal,
-        crossed_down: bool,
-    ) -> Decimal:
-        spread_score = self.spread_score(price, fast_ema, slow_ema)
-        rsi_excess = max(Decimal("0"), current_rsi - self.config.rsi_sell_min)
-        rsi_score = min(Decimal("1"), rsi_excess / Decimal("15"))
-        cross_score = Decimal("0.60") if crossed_down else Decimal("0.25")
-        return self.clamp_confidence(cross_score + (spread_score * Decimal("0.25")) + (rsi_score * Decimal("0.15")))
-
-    @staticmethod
-    def spread_score(price: Decimal, fast_ema: float, slow_ema: float) -> Decimal:
-        if price <= 0:
-            return Decimal("0")
-        spread = abs(Decimal(str(fast_ema)) - Decimal(str(slow_ema))) / price
-        return min(Decimal("1"), spread / Decimal("0.002"))
-
-    @staticmethod
-    def clamp_confidence(value: Decimal) -> Decimal:
-        return max(Decimal("0"), min(Decimal("1"), value))
+@dataclass(frozen=True)
+class ComponentScores:
+    bullish: Decimal
+    bearish: Decimal
 
 
-class SmcStrategy:
-    """Rule-based Smart Money Concepts strategy.
+def create_strategy(config: BotConfig) -> "CombinedMarketStructureStrategy":
+    return CombinedMarketStructureStrategy(config)
 
-    It looks for confirmed swing structure, break of structure, recent bullish
-    order blocks, and optionally fair value gaps. In swap mode, bullish signals
-    open longs and bearish signals open shorts or close existing longs.
+
+class CombinedMarketStructureStrategy:
+    """Order flow, liquidity sweep, anchored VWAP, volume profile, and SMC model.
+
+    Confidence is a weighted composite of all five modules. It should be read as
+    a signal-strength estimate, not a guaranteed win rate.
     """
+
+    WEIGHTS = {
+        "order_flow": Decimal("0.18"),
+        "liquidity_sweep": Decimal("0.20"),
+        "anchored_vwap": Decimal("0.20"),
+        "volume_profile": Decimal("0.17"),
+        "smc": Decimal("0.25"),
+    }
 
     def __init__(self, config: BotConfig) -> None:
         self.config = config
 
     def generate(self, candles: list[Candle]) -> Signal:
         current_price = candles[-1].close if candles else Decimal("0")
-        minimum_candles = (self.config.smc_swing_lookback * 2) + self.config.smc_zone_lookback + 5
+        minimum_candles = self.minimum_candles()
         if len(candles) < minimum_candles:
-            return Signal("hold", "Not enough candles for SMC structure.", current_price)
+            return Signal(
+                "hold",
+                f"Not enough candles for combined strategy ({len(candles)} < {minimum_candles}).",
+                current_price,
+            )
 
-        swing_highs, swing_lows = self.find_swings(candles)
-        if len(swing_highs) < 2 or len(swing_lows) < 2:
-            return Signal("hold", "Not enough confirmed swing points for SMC.", current_price)
+        latest = candles[-1]
+        previous = candles[-2]
+        structure_window = candles[-self.config.combined_structure_lookback - 1 : -1]
+        recent_high = max(candle.high for candle in structure_window)
+        recent_low = min(candle.low for candle in structure_window)
 
-        previous_candle = candles[-2]
-        latest_candle = candles[-1]
-        last_high = swing_highs[-1]
-        previous_high = swing_highs[-2]
-        last_low = swing_lows[-1]
-        previous_low = swing_lows[-2]
+        order_flow = self.order_flow_scores(candles)
+        liquidity = self.liquidity_sweep_scores(latest, recent_high, recent_low)
+        avwap, avwap_indicators = self.anchored_vwap_scores(candles)
+        profile, profile_indicators = self.volume_profile_scores(candles)
+        smc, smc_indicators = self.smc_scores(candles, previous, latest, recent_high, recent_low)
 
-        bullish_structure = last_high.price > previous_high.price and last_low.price > previous_low.price
-        bearish_structure = last_high.price < previous_high.price and last_low.price < previous_low.price
-        bullish_bos = self.broke_above(previous_candle.close, latest_candle.close, last_high.price)
-        bearish_bos = self.broke_below(previous_candle.close, latest_candle.close, last_low.price)
-        bullish_displacement = self.has_displacement(latest_candle.close, last_high.price)
-        bearish_displacement = self.has_displacement(last_low.price, latest_candle.close)
-        bullish_fvg = self.has_recent_bullish_fvg(candles)
-        bullish_order_block = self.find_bullish_order_block(candles)
-        in_order_block = self.price_in_zone(current_price, bullish_order_block)
+        bullish_score = self.weighted_score(
+            order_flow.bullish,
+            liquidity.bullish,
+            avwap.bullish,
+            profile.bullish,
+            smc.bullish,
+        )
+        bearish_score = self.weighted_score(
+            order_flow.bearish,
+            liquidity.bearish,
+            avwap.bearish,
+            profile.bearish,
+            smc.bearish,
+        )
+
+        edge = abs(bullish_score - bearish_score)
+        indicators = {
+            "order_flow_bullish_score": float(order_flow.bullish),
+            "order_flow_bearish_score": float(order_flow.bearish),
+            "liquidity_sweep_bullish_score": float(liquidity.bullish),
+            "liquidity_sweep_bearish_score": float(liquidity.bearish),
+            "anchored_vwap_bullish_score": float(avwap.bullish),
+            "anchored_vwap_bearish_score": float(avwap.bearish),
+            "volume_profile_bullish_score": float(profile.bullish),
+            "volume_profile_bearish_score": float(profile.bearish),
+            "smc_bullish_score": float(smc.bullish),
+            "smc_bearish_score": float(smc.bearish),
+            "bullish_score": float(bullish_score),
+            "bearish_score": float(bearish_score),
+            "strategy_edge": float(edge),
+            "integrated_strategy_confidence": float(max(bullish_score, bearish_score)),
+            "recent_high": float(recent_high),
+            "recent_low": float(recent_low),
+            **avwap_indicators,
+            **profile_indicators,
+            **smc_indicators,
+        }
+
+        if bullish_score >= self.config.combined_min_score and edge >= self.config.combined_min_edge and bullish_score > bearish_score:
+            reason = self.reason("long", bullish_score, edge, indicators)
+            return Signal("buy", reason, current_price, {**indicators, "confidence": float(bullish_score)}, bullish_score)
+
+        if bearish_score >= self.config.combined_min_score and edge >= self.config.combined_min_edge and bearish_score > bullish_score:
+            reason = self.reason("short", bearish_score, edge, indicators)
+            return Signal("sell", reason, current_price, {**indicators, "confidence": float(bearish_score)}, bearish_score)
+
+        confidence = max(bullish_score, bearish_score)
+        reason = (
+            "Combined strategy score did not reach threshold or directional edge. "
+            f"bullish={self.format_percent(bullish_score)}, bearish={self.format_percent(bearish_score)}, "
+            f"edge={self.format_percent(edge)}."
+        )
+        return Signal("hold", reason, current_price, {**indicators, "confidence": float(confidence)}, confidence)
+
+    def order_flow_scores(self, candles: list[Candle]) -> ComponentScores:
+        latest = candles[-1]
+        previous = candles[-self.config.combined_order_flow_lookback - 1 : -1]
+        avg_volume = self.average([candle.volume for candle in previous])
+        candle_range = latest.high - latest.low
+        if candle_range <= 0:
+            return ComponentScores(Decimal("0"), Decimal("0"))
+
+        body_ratio = (latest.close - latest.open) / candle_range
+        close_location = (latest.close - latest.low) / candle_range
+        volume_ratio = latest.volume / avg_volume if avg_volume > 0 else Decimal("1")
+        volume_score = self.clamp(volume_ratio / Decimal("1.5"))
+
+        bullish = Decimal("0")
+        bearish = Decimal("0")
+        if body_ratio > 0:
+            bullish = self.clamp((body_ratio * Decimal("0.65")) + (volume_score * Decimal("0.25")) + (close_location * Decimal("0.10")))
+        elif body_ratio < 0:
+            bearish_close_location = Decimal("1") - close_location
+            bearish = self.clamp((abs(body_ratio) * Decimal("0.65")) + (volume_score * Decimal("0.25")) + (bearish_close_location * Decimal("0.10")))
+
+        return ComponentScores(bullish, bearish)
+
+    def liquidity_sweep_scores(self, latest: Candle, recent_high: Decimal, recent_low: Decimal) -> ComponentScores:
+        tolerance = self.config.combined_sweep_tolerance_pct
+        bullish_sweep = latest.low < recent_low * (Decimal("1") - tolerance) and latest.close > recent_low and latest.close > latest.open
+        bearish_sweep = latest.high > recent_high * (Decimal("1") + tolerance) and latest.close < recent_high and latest.close < latest.open
+
+        bullish = Decimal("1") if bullish_sweep else Decimal("0")
+        bearish = Decimal("1") if bearish_sweep else Decimal("0")
+        return ComponentScores(bullish, bearish)
+
+    def anchored_vwap_scores(self, candles: list[Candle]) -> tuple[ComponentScores, dict[str, float]]:
+        window_start = max(0, len(candles) - self.config.combined_avwap_lookback)
+        window = candles[window_start:]
+        latest = candles[-1]
+        low_anchor_index = window_start + min(range(len(window)), key=lambda index: window[index].low)
+        high_anchor_index = window_start + max(range(len(window)), key=lambda index: window[index].high)
+        bullish_vwap = self.anchored_vwap(candles[low_anchor_index:])
+        bearish_vwap = self.anchored_vwap(candles[high_anchor_index:])
+
+        bullish = Decimal("0")
+        bearish = Decimal("0")
+        if bullish_vwap > 0 and latest.close > bullish_vwap:
+            reclaim_bonus = Decimal("0.25") if candles[-2].close <= bullish_vwap or latest.low <= bullish_vwap else Decimal("0")
+            bullish = self.clamp(Decimal("0.75") + reclaim_bonus)
+        if bearish_vwap > 0 and latest.close < bearish_vwap:
+            reject_bonus = Decimal("0.25") if candles[-2].close >= bearish_vwap or latest.high >= bearish_vwap else Decimal("0")
+            bearish = self.clamp(Decimal("0.75") + reject_bonus)
 
         indicators = {
-            "last_swing_high": float(last_high.price),
-            "last_swing_low": float(last_low.price),
+            "anchored_vwap_from_low": float(bullish_vwap),
+            "anchored_vwap_from_high": float(bearish_vwap),
+        }
+        return ComponentScores(bullish, bearish), indicators
+
+    def volume_profile_scores(self, candles: list[Candle]) -> tuple[ComponentScores, dict[str, float]]:
+        profile_window = candles[-self.config.combined_volume_profile_lookback :]
+        profile = self.build_volume_profile(profile_window)
+        latest = candles[-1]
+
+        bullish = Decimal("0")
+        bearish = Decimal("0")
+        if latest.close > profile.poc:
+            bullish = Decimal("0.65")
+            if latest.close > profile.value_area_high:
+                bullish += Decimal("0.20")
+            if latest.low <= profile.value_area_low <= latest.close:
+                bullish += Decimal("0.15")
+        if latest.close < profile.poc:
+            bearish = Decimal("0.65")
+            if latest.close < profile.value_area_low:
+                bearish += Decimal("0.20")
+            if latest.high >= profile.value_area_high >= latest.close:
+                bearish += Decimal("0.15")
+
+        indicators = {
+            "volume_profile_poc": float(profile.poc),
+            "volume_profile_value_area_low": float(profile.value_area_low),
+            "volume_profile_value_area_high": float(profile.value_area_high),
+        }
+        return ComponentScores(self.clamp(bullish), self.clamp(bearish)), indicators
+
+    def smc_scores(
+        self,
+        candles: list[Candle],
+        previous: Candle,
+        latest: Candle,
+        recent_high: Decimal,
+        recent_low: Decimal,
+    ) -> tuple[ComponentScores, dict[str, float]]:
+        swing_highs, swing_lows = self.find_swings(candles)
+        last_high = swing_highs[-1].price if swing_highs else recent_high
+        previous_high = swing_highs[-2].price if len(swing_highs) >= 2 else recent_high
+        last_low = swing_lows[-1].price if swing_lows else recent_low
+        previous_low = swing_lows[-2].price if len(swing_lows) >= 2 else recent_low
+
+        bullish_structure = last_high >= previous_high and last_low >= previous_low and latest.close > previous.close
+        bearish_structure = last_high <= previous_high and last_low <= previous_low and latest.close < previous.close
+        bullish_bos = previous.close <= last_high < latest.close or latest.close > recent_high
+        bearish_bos = previous.close >= last_low > latest.close or latest.close < recent_low
+        bullish_displacement = self.has_displacement(latest.close, last_high)
+        bearish_displacement = self.has_displacement(last_low, latest.close)
+        bullish_fvg = self.has_recent_fvg(candles, "bullish")
+        bearish_fvg = self.has_recent_fvg(candles, "bearish")
+        bullish_order_block = self.find_order_block(candles, "bullish")
+        bearish_order_block = self.find_order_block(candles, "bearish")
+
+        bullish = Decimal("0")
+        bullish += Decimal("0.35") if bullish_bos else Decimal("0")
+        bullish += Decimal("0.20") if bullish_structure else Decimal("0")
+        bullish += Decimal("0.15") if bullish_displacement else Decimal("0")
+        bullish += Decimal("0.15") if bullish_fvg else Decimal("0")
+        bullish += Decimal("0.15") if bullish_order_block is not None else Decimal("0")
+
+        bearish = Decimal("0")
+        bearish += Decimal("0.35") if bearish_bos else Decimal("0")
+        bearish += Decimal("0.20") if bearish_structure else Decimal("0")
+        bearish += Decimal("0.15") if bearish_displacement else Decimal("0")
+        bearish += Decimal("0.15") if bearish_fvg else Decimal("0")
+        bearish += Decimal("0.15") if bearish_order_block is not None else Decimal("0")
+
+        indicators = {
+            "last_swing_high": float(last_high),
+            "last_swing_low": float(last_low),
             "bullish_structure": 1.0 if bullish_structure else 0.0,
             "bearish_structure": 1.0 if bearish_structure else 0.0,
             "bullish_bos": 1.0 if bullish_bos else 0.0,
             "bearish_bos": 1.0 if bearish_bos else 0.0,
             "bullish_fvg": 1.0 if bullish_fvg else 0.0,
-            "order_block_bottom": float(bullish_order_block.bottom) if bullish_order_block else 0.0,
-            "order_block_top": float(bullish_order_block.top) if bullish_order_block else 0.0,
+            "bearish_fvg": 1.0 if bearish_fvg else 0.0,
+            "bullish_order_block_bottom": float(bullish_order_block.bottom) if bullish_order_block else 0.0,
+            "bullish_order_block_top": float(bullish_order_block.top) if bullish_order_block else 0.0,
+            "bearish_order_block_bottom": float(bearish_order_block.bottom) if bearish_order_block else 0.0,
+            "bearish_order_block_top": float(bearish_order_block.top) if bearish_order_block else 0.0,
         }
+        return ComponentScores(self.clamp(bullish), self.clamp(bearish)), indicators
 
-        if bearish_bos and bearish_displacement:
-            confidence = self.bearish_confidence(bearish_bos, bearish_displacement, bearish_structure, latest_candle.close < latest_candle.open)
-            return Signal(
-                "sell",
-                "SMC bearish break of structure with displacement.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        if bearish_structure and latest_candle.close < last_low.price:
-            confidence = self.bearish_confidence(True, bearish_displacement, bearish_structure, latest_candle.close < latest_candle.open)
-            return Signal(
-                "sell",
-                "SMC bearish market structure invalidated the long thesis.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        fvg_ok = bullish_fvg or not self.config.smc_require_fvg
-        if bullish_bos and bullish_displacement and fvg_ok:
-            confidence = self.bullish_bos_confidence(bullish_bos, bullish_displacement, bullish_structure, bullish_fvg, bullish_order_block is not None)
-            return Signal(
-                "buy",
-                "SMC bullish break of structure with displacement.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        if bullish_structure and bullish_order_block and in_order_block and fvg_ok and latest_candle.close > latest_candle.open:
-            confidence = self.bullish_pullback_confidence(bullish_structure, in_order_block, bullish_fvg, latest_candle.close > latest_candle.open)
-            return Signal(
-                "buy",
-                "SMC pullback into bullish order block with bullish structure.",
-                current_price,
-                {**indicators, "confidence": float(confidence)},
-                confidence,
-            )
-
-        return Signal("hold", "No SMC entry or exit signal.", current_price, indicators)
-
-    @staticmethod
-    def bullish_bos_confidence(
-        bullish_bos: bool,
-        bullish_displacement: bool,
-        bullish_structure: bool,
-        bullish_fvg: bool,
-        has_order_block: bool,
+    def weighted_score(
+        self,
+        order_flow: Decimal,
+        liquidity: Decimal,
+        avwap: Decimal,
+        profile: Decimal,
+        smc: Decimal,
     ) -> Decimal:
-        score = Decimal("0")
-        score += Decimal("0.35") if bullish_bos else Decimal("0")
-        score += Decimal("0.25") if bullish_displacement else Decimal("0")
-        score += Decimal("0.20") if bullish_structure else Decimal("0")
-        score += Decimal("0.10") if bullish_fvg else Decimal("0")
-        score += Decimal("0.10") if has_order_block else Decimal("0")
-        return min(Decimal("1"), score)
+        return self.clamp(
+            (order_flow * self.WEIGHTS["order_flow"])
+            + (liquidity * self.WEIGHTS["liquidity_sweep"])
+            + (avwap * self.WEIGHTS["anchored_vwap"])
+            + (profile * self.WEIGHTS["volume_profile"])
+            + (smc * self.WEIGHTS["smc"])
+        )
 
-    @staticmethod
-    def bullish_pullback_confidence(
-        bullish_structure: bool,
-        in_order_block: bool,
-        bullish_fvg: bool,
-        bullish_candle: bool,
-    ) -> Decimal:
-        score = Decimal("0")
-        score += Decimal("0.30") if bullish_structure else Decimal("0")
-        score += Decimal("0.35") if in_order_block else Decimal("0")
-        score += Decimal("0.20") if bullish_fvg else Decimal("0")
-        score += Decimal("0.15") if bullish_candle else Decimal("0")
-        return min(Decimal("1"), score)
+    def build_volume_profile(self, candles: list[Candle]) -> VolumeProfile:
+        low = min(candle.low for candle in candles)
+        high = max(candle.high for candle in candles)
+        bins = self.config.combined_volume_profile_bins
+        if high <= low:
+            return VolumeProfile(candles[-1].close, low, high)
 
-    @staticmethod
-    def bearish_confidence(
-        bearish_bos: bool,
-        bearish_displacement: bool,
-        bearish_structure: bool,
-        bearish_candle: bool,
-    ) -> Decimal:
-        score = Decimal("0")
-        score += Decimal("0.40") if bearish_bos else Decimal("0")
-        score += Decimal("0.25") if bearish_displacement else Decimal("0")
-        score += Decimal("0.25") if bearish_structure else Decimal("0")
-        score += Decimal("0.10") if bearish_candle else Decimal("0")
-        return min(Decimal("1"), score)
+        step = (high - low) / Decimal(bins)
+        volumes = [Decimal("0") for _ in range(bins)]
+        for candle in candles:
+            typical_price = (candle.high + candle.low + candle.close) / Decimal("3")
+            index = int((typical_price - low) / step)
+            index = max(0, min(bins - 1, index))
+            volumes[index] += candle.volume
+
+        poc_index = max(range(bins), key=lambda index: volumes[index])
+        total_volume = sum(volumes, Decimal("0"))
+        target_volume = total_volume * self.config.combined_value_area_pct
+        low_index = poc_index
+        high_index = poc_index
+        accumulated = volumes[poc_index]
+
+        while accumulated < target_volume and (low_index > 0 or high_index < bins - 1):
+            left_volume = volumes[low_index - 1] if low_index > 0 else Decimal("-1")
+            right_volume = volumes[high_index + 1] if high_index < bins - 1 else Decimal("-1")
+            if right_volume >= left_volume and high_index < bins - 1:
+                high_index += 1
+                accumulated += volumes[high_index]
+            elif low_index > 0:
+                low_index -= 1
+                accumulated += volumes[low_index]
+            else:
+                break
+
+        poc = low + (step * (Decimal(poc_index) + Decimal("0.5")))
+        value_area_low = low + (step * Decimal(low_index))
+        value_area_high = low + (step * Decimal(high_index + 1))
+        return VolumeProfile(poc, value_area_low, value_area_high)
+
+    def anchored_vwap(self, candles: list[Candle]) -> Decimal:
+        total_volume = sum((candle.volume for candle in candles), Decimal("0"))
+        if total_volume <= 0:
+            return Decimal("0")
+        total = Decimal("0")
+        for candle in candles:
+            typical_price = (candle.high + candle.low + candle.close) / Decimal("3")
+            total += typical_price * candle.volume
+        return total / total_volume
 
     def find_swings(self, candles: list[Candle]) -> tuple[list[SwingPoint], list[SwingPoint]]:
-        lookback = self.config.smc_swing_lookback
+        lookback = self.config.combined_swing_lookback
         swing_highs: list[SwingPoint] = []
         swing_lows: list[SwingPoint] = []
 
@@ -276,47 +350,69 @@ class SmcStrategy:
 
         return swing_highs, swing_lows
 
-    def find_bullish_order_block(self, candles: list[Candle]) -> PriceZone | None:
-        start = max(0, len(candles) - self.config.smc_zone_lookback - 1)
+    def find_order_block(self, candles: list[Candle], side: str) -> PriceZone | None:
+        start = max(0, len(candles) - self.config.combined_structure_lookback - 1)
         for index in range(len(candles) - 2, start, -1):
             candle = candles[index]
             next_candle = candles[index + 1]
-            if candle.close < candle.open and next_candle.close > next_candle.open:
-                return PriceZone(
-                    bottom=candle.low,
-                    top=max(candle.open, candle.close),
-                    index=index,
-                )
+            if side == "bullish" and candle.close < candle.open and next_candle.close > next_candle.open:
+                return PriceZone(bottom=candle.low, top=max(candle.open, candle.close), index=index)
+            if side == "bearish" and candle.close > candle.open and next_candle.close < next_candle.open:
+                return PriceZone(bottom=min(candle.open, candle.close), top=candle.high, index=index)
         return None
 
-    def has_recent_bullish_fvg(self, candles: list[Candle]) -> bool:
-        start = max(2, len(candles) - self.config.smc_zone_lookback)
+    def has_recent_fvg(self, candles: list[Candle], side: str) -> bool:
+        start = max(2, len(candles) - self.config.combined_structure_lookback)
         for index in range(start, len(candles)):
-            if candles[index - 2].high < candles[index].low:
+            if side == "bullish" and candles[index - 2].high < candles[index].low:
+                return True
+            if side == "bearish" and candles[index - 2].low > candles[index].high:
                 return True
         return False
-
-    def price_in_zone(self, price: Decimal, zone: PriceZone | None) -> bool:
-        if zone is None:
-            return False
-        tolerance = self.config.smc_zone_tolerance_pct
-        lower = zone.bottom * (Decimal("1") - tolerance)
-        upper = zone.top * (Decimal("1") + tolerance)
-        return lower <= price <= upper
 
     def has_displacement(self, higher_price: Decimal, lower_price: Decimal) -> bool:
         if lower_price <= 0:
             return False
         move_pct = abs(higher_price - lower_price) / lower_price
-        return move_pct >= self.config.smc_min_displacement_pct
+        return move_pct >= self.config.combined_min_displacement_pct
+
+    def minimum_candles(self) -> int:
+        return max(
+            self.config.combined_structure_lookback,
+            self.config.combined_volume_profile_lookback,
+            self.config.combined_avwap_lookback,
+            self.config.combined_order_flow_lookback,
+            (self.config.combined_swing_lookback * 2) + 5,
+        ) + 2
+
+    def reason(self, side: str, confidence: Decimal, edge: Decimal, indicators: dict[str, float]) -> str:
+        suffix = "long" if side == "long" else "short"
+        aligned = [
+            "order flow" if indicators[f"order_flow_{'bullish' if side == 'long' else 'bearish'}_score"] >= 0.5 else "",
+            "liquidity sweep" if indicators[f"liquidity_sweep_{'bullish' if side == 'long' else 'bearish'}_score"] >= 0.5 else "",
+            "anchored VWAP" if indicators[f"anchored_vwap_{'bullish' if side == 'long' else 'bearish'}_score"] >= 0.5 else "",
+            "volume profile" if indicators[f"volume_profile_{'bullish' if side == 'long' else 'bearish'}_score"] >= 0.5 else "",
+            "SMC" if indicators[f"smc_{'bullish' if side == 'long' else 'bearish'}_score"] >= 0.5 else "",
+        ]
+        modules = ", ".join(item for item in aligned if item) or "mixed modules"
+        return (
+            f"Combined {suffix} setup confirmed by {modules}. "
+            f"Integrated confidence={self.format_percent(confidence)}, edge={self.format_percent(edge)}."
+        )
 
     @staticmethod
-    def broke_above(previous_close: Decimal, current_close: Decimal, level: Decimal) -> bool:
-        return previous_close <= level < current_close
+    def average(values: list[Decimal]) -> Decimal:
+        if not values:
+            return Decimal("0")
+        return sum(values, Decimal("0")) / Decimal(len(values))
 
     @staticmethod
-    def broke_below(previous_close: Decimal, current_close: Decimal, level: Decimal) -> bool:
-        return previous_close >= level > current_close
+    def clamp(value: Decimal) -> Decimal:
+        return max(Decimal("0"), min(Decimal("1"), value))
+
+    @staticmethod
+    def format_percent(value: Decimal) -> str:
+        return f"{(value * Decimal('100')).quantize(Decimal('0.01'))}%"
 
     @staticmethod
     def is_unique_high(high: Decimal, candles: list[Candle]) -> bool:

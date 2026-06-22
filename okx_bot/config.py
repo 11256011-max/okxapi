@@ -6,6 +6,13 @@ from decimal import Decimal, InvalidOperation
 
 
 TRUE_VALUES = {"1", "true", "yes", "y", "on"}
+STRATEGY_ALIASES = {
+    "ema_rsi": "combined",
+    "smc": "combined",
+    "order_flow": "combined",
+    "combined_order_flow": "combined",
+    "combined_market_structure": "combined",
+}
 
 
 class ConfigError(ValueError):
@@ -47,6 +54,11 @@ def env_probability(name: str, default: str) -> Decimal:
     if value > Decimal("1") and value <= Decimal("100"):
         return value / Decimal("100")
     return value
+
+
+def normalize_strategy(strategy: str) -> str:
+    normalized = strategy.strip().lower()
+    return STRATEGY_ALIASES.get(normalized, normalized)
 
 
 def parse_score_value(name: str, raw: str) -> Decimal:
@@ -106,6 +118,17 @@ class BotConfig:
     max_leverage: int
     strategy: str
     signal_confidence_threshold: Decimal
+    combined_swing_lookback: int
+    combined_structure_lookback: int
+    combined_order_flow_lookback: int
+    combined_avwap_lookback: int
+    combined_volume_profile_lookback: int
+    combined_volume_profile_bins: int
+    combined_value_area_pct: Decimal
+    combined_sweep_tolerance_pct: Decimal
+    combined_min_displacement_pct: Decimal
+    combined_min_score: Decimal
+    combined_min_edge: Decimal
     fast_ema: int
     slow_ema: int
     rsi_period: int
@@ -169,12 +192,23 @@ class BotConfig:
             poll_seconds=env_int("POLL_SECONDS", 60),
             market_type=market_type,
             margin_mode=os.getenv("MARGIN_MODE", "isolated").strip().lower(),
-            position_mode=os.getenv("POSITION_MODE", "net").strip().lower(),
+            position_mode=os.getenv("POSITION_MODE", "auto").strip().lower(),
             risk_per_trade_pct=env_probability("RISK_PER_TRADE_PCT", "0.01"),
             daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
             max_leverage=env_int("MAX_LEVERAGE", 10),
-            strategy=os.getenv("STRATEGY", "ema_rsi").strip().lower(),
+            strategy=normalize_strategy(os.getenv("STRATEGY", "combined")),
             signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"),
+            combined_swing_lookback=env_int("COMBINED_SWING_LOOKBACK", 3),
+            combined_structure_lookback=env_int("COMBINED_STRUCTURE_LOOKBACK", 40),
+            combined_order_flow_lookback=env_int("COMBINED_ORDER_FLOW_LOOKBACK", 20),
+            combined_avwap_lookback=env_int("COMBINED_AVWAP_LOOKBACK", 80),
+            combined_volume_profile_lookback=env_int("COMBINED_VOLUME_PROFILE_LOOKBACK", 80),
+            combined_volume_profile_bins=env_int("COMBINED_VOLUME_PROFILE_BINS", 24),
+            combined_value_area_pct=env_probability("COMBINED_VALUE_AREA_PCT", "0.70"),
+            combined_sweep_tolerance_pct=env_decimal("COMBINED_SWEEP_TOLERANCE_PCT", "0.001"),
+            combined_min_displacement_pct=env_decimal("COMBINED_MIN_DISPLACEMENT_PCT", "0.002"),
+            combined_min_score=env_probability("COMBINED_MIN_SCORE", "0.80"),
+            combined_min_edge=env_probability("COMBINED_MIN_EDGE", "0.10"),
             fast_ema=env_int("FAST_EMA", 9),
             slow_ema=env_int("SLOW_EMA", 21),
             rsi_period=env_int("RSI_PERIOD", 14),
@@ -227,35 +261,47 @@ class BotConfig:
             raise ConfigError("This bot is swap-only. Set MARKET_TYPE=swap.")
         if self.margin_mode not in {"isolated", "cross"}:
             raise ConfigError("MARGIN_MODE must be isolated or cross.")
-        if self.position_mode not in {"net", "hedge"}:
-            raise ConfigError("POSITION_MODE must be net or hedge.")
+        if self.position_mode not in {"auto", "net", "hedge"}:
+            raise ConfigError("POSITION_MODE must be auto, net, or hedge.")
         if not Decimal("0") < self.risk_per_trade_pct <= Decimal("1"):
             raise ConfigError("RISK_PER_TRADE_PCT must be between 0 and 1, or 0 and 100 percent.")
         if not Decimal("0") < self.daily_max_loss_pct <= Decimal("1"):
             raise ConfigError("DAILY_MAX_LOSS_PCT must be between 0 and 1, or 0 and 100 percent.")
         if self.max_leverage < 1:
             raise ConfigError("MAX_LEVERAGE must be at least 1.")
-        if self.strategy not in {"ema_rsi", "smc"}:
-            raise ConfigError("STRATEGY must be one of: ema_rsi, smc.")
+        if self.strategy != "combined":
+            raise ConfigError("STRATEGY must be combined. Legacy ema_rsi/smc values are mapped to combined automatically.")
         if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
             raise ConfigError("SIGNAL_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
-        if self.strategy == "ema_rsi":
-            if self.fast_ema <= 1 or self.slow_ema <= 1:
-                raise ConfigError("FAST_EMA and SLOW_EMA must be greater than 1.")
-            if self.fast_ema >= self.slow_ema:
-                raise ConfigError("FAST_EMA must be smaller than SLOW_EMA.")
-            if self.candle_limit < max(self.slow_ema, self.rsi_period) + 5:
-                raise ConfigError("CANDLE_LIMIT is too small for the configured indicators.")
-        if self.strategy == "smc":
-            if self.smc_swing_lookback < 2:
-                raise ConfigError("SMC_SWING_LOOKBACK must be at least 2.")
-            if self.smc_zone_lookback < 5:
-                raise ConfigError("SMC_ZONE_LOOKBACK must be at least 5.")
-            if self.smc_zone_tolerance_pct < 0 or self.smc_min_displacement_pct < 0:
-                raise ConfigError("SMC percentage settings cannot be negative.")
-            minimum_smc_candles = (self.smc_swing_lookback * 2) + self.smc_zone_lookback + 5
-            if self.candle_limit < minimum_smc_candles:
-                raise ConfigError(f"CANDLE_LIMIT must be at least {minimum_smc_candles} for SMC.")
+        if self.combined_swing_lookback < 2:
+            raise ConfigError("COMBINED_SWING_LOOKBACK must be at least 2.")
+        if self.combined_structure_lookback < 5:
+            raise ConfigError("COMBINED_STRUCTURE_LOOKBACK must be at least 5.")
+        if self.combined_order_flow_lookback < 2:
+            raise ConfigError("COMBINED_ORDER_FLOW_LOOKBACK must be at least 2.")
+        if self.combined_avwap_lookback < 5:
+            raise ConfigError("COMBINED_AVWAP_LOOKBACK must be at least 5.")
+        if self.combined_volume_profile_lookback < 5:
+            raise ConfigError("COMBINED_VOLUME_PROFILE_LOOKBACK must be at least 5.")
+        if self.combined_volume_profile_bins < 5:
+            raise ConfigError("COMBINED_VOLUME_PROFILE_BINS must be at least 5.")
+        if not Decimal("0") < self.combined_value_area_pct <= Decimal("1"):
+            raise ConfigError("COMBINED_VALUE_AREA_PCT must be between 0 and 1, or 0 and 100 percent.")
+        if self.combined_sweep_tolerance_pct < 0 or self.combined_min_displacement_pct < 0:
+            raise ConfigError("Combined strategy percentage settings cannot be negative.")
+        if not Decimal("0") <= self.combined_min_score <= Decimal("1"):
+            raise ConfigError("COMBINED_MIN_SCORE must be between 0 and 1, or 0 and 100 percent.")
+        if not Decimal("0") <= self.combined_min_edge <= Decimal("1"):
+            raise ConfigError("COMBINED_MIN_EDGE must be between 0 and 1, or 0 and 100 percent.")
+        minimum_combined_candles = max(
+            self.combined_structure_lookback,
+            self.combined_volume_profile_lookback,
+            self.combined_avwap_lookback,
+            self.combined_order_flow_lookback,
+            (self.combined_swing_lookback * 2) + 5,
+        ) + 2
+        if self.candle_limit < minimum_combined_candles:
+            raise ConfigError(f"CANDLE_LIMIT must be at least {minimum_combined_candles} for the combined strategy.")
         if self.newsapi_page_size < 1 or self.newsapi_page_size > 100:
             raise ConfigError("NEWSAPI_PAGE_SIZE must be between 1 and 100.")
         if self.external_context_lookback_hours < 1:
