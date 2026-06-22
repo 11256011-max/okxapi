@@ -33,6 +33,12 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 config.validate()
 
+    def test_spot_market_type_is_rejected(self) -> None:
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"MARKET_TYPE": "spot"}, clear=True):
+            config = BotConfig.from_env()
+            with self.assertRaises(ConfigError):
+                config.validate()
+
     def test_signal_confidence_threshold_accepts_percent(self) -> None:
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "80"}, clear=True):
             config = BotConfig.from_env()

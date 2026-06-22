@@ -16,8 +16,7 @@ def utc_date() -> str:
 class SymbolPosition:
     position_base: Decimal = Decimal("0")
     entry_price: Decimal = Decimal("0")
-    protective_algo_id: str | None = None
-    protective_algo_cl_ord_id: str | None = None
+    side: str | None = None
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any] | None) -> "SymbolPosition":
@@ -25,16 +24,14 @@ class SymbolPosition:
         return cls(
             position_base=Decimal(str(raw.get("position_base", "0"))),
             entry_price=Decimal(str(raw.get("entry_price", "0"))),
-            protective_algo_id=raw.get("protective_algo_id") or None,
-            protective_algo_cl_ord_id=raw.get("protective_algo_cl_ord_id") or None,
+            side=raw.get("side") or ("long" if Decimal(str(raw.get("position_base", "0"))) > 0 else None),
         )
 
     def to_json(self) -> dict[str, str | None]:
         return {
             "position_base": str(self.position_base),
             "entry_price": str(self.entry_price),
-            "protective_algo_id": self.protective_algo_id,
-            "protective_algo_cl_ord_id": self.protective_algo_cl_ord_id,
+            "side": self.side,
         }
 
 
@@ -42,6 +39,7 @@ class SymbolPosition:
 class BotState:
     day: str = field(default_factory=utc_date)
     daily_notional: Decimal = Decimal("0")
+    daily_realized_pnl: Decimal = Decimal("0")
     positions: dict[str, SymbolPosition] = field(default_factory=dict)
     trades: list[dict[str, Any]] = field(default_factory=list)
     default_symbol: str = "BTC/USDT"
@@ -59,6 +57,7 @@ class BotState:
         state = cls(
             day=raw.get("day", utc_date()),
             daily_notional=Decimal(str(raw.get("daily_notional", "0"))),
+            daily_realized_pnl=Decimal(str(raw.get("daily_realized_pnl", "0"))),
             positions=positions,
             trades=raw.get("trades", []),
             default_symbol=default_symbol,
@@ -81,8 +80,6 @@ class BotState:
         migrated = SymbolPosition(
             position_base=Decimal(str(raw.get("position_base", "0"))),
             entry_price=Decimal(str(raw.get("entry_price", "0"))),
-            protective_algo_id=raw.get("protective_algo_id") or None,
-            protective_algo_cl_ord_id=raw.get("protective_algo_cl_ord_id") or None,
         )
         return {default_symbol: migrated}
 
@@ -93,6 +90,7 @@ class BotState:
                 {
                     "day": self.day,
                     "daily_notional": str(self.daily_notional),
+                    "daily_realized_pnl": str(self.daily_realized_pnl),
                     "positions": {
                         symbol: position.to_json()
                         for symbol, position in sorted(self.positions.items())
@@ -110,6 +108,7 @@ class BotState:
         if self.day != today:
             self.day = today
             self.daily_notional = Decimal("0")
+            self.daily_realized_pnl = Decimal("0")
 
     def ensure_symbol(self, symbol: str | None) -> SymbolPosition:
         key = symbol or self.default_symbol
@@ -123,8 +122,8 @@ class BotState:
     def get_entry_price(self, symbol: str | None = None) -> Decimal:
         return self.ensure_symbol(symbol).entry_price
 
-    def get_protective_algo_id(self, symbol: str | None = None) -> str | None:
-        return self.ensure_symbol(symbol).protective_algo_id
+    def get_position_side(self, symbol: str | None = None) -> str | None:
+        return self.ensure_symbol(symbol).side
 
     def record_trade(
         self,
@@ -135,6 +134,9 @@ class BotState:
         mode: str,
         order_id: str | None = None,
         symbol: str | None = None,
+        position_side: str | None = None,
+        reduce_only: bool = False,
+        realized_pnl: Decimal = Decimal("0"),
     ) -> None:
         symbol = symbol or self.default_symbol
         position = self.ensure_symbol(symbol)
@@ -150,10 +152,25 @@ class BotState:
                 "quote_notional": str(quote_notional),
                 "mode": mode,
                 "order_id": order_id,
+                "position_side": position_side,
+                "reduce_only": reduce_only,
+                "realized_pnl": str(realized_pnl),
             }
         )
+        self.daily_realized_pnl += realized_pnl
+
+        if position_side in {"long", "short"} and not reduce_only:
+            self.open_position(position, position_side, amount_base, price)
+            return
+
+        if reduce_only:
+            position.position_base = max(Decimal("0"), position.position_base - amount_base)
+            if position.position_base == 0:
+                self.clear_symbol_position(symbol)
+            return
 
         if side == "buy":
+            position.side = "long"
             new_total_base = position.position_base + amount_base
             if new_total_base > 0:
                 previous_cost = position.position_base * position.entry_price
@@ -165,24 +182,23 @@ class BotState:
             if position.position_base == 0:
                 self.clear_symbol_position(symbol)
 
-    def set_protective_order(
-        self,
-        symbol: str,
-        algo_id: str | None,
-        algo_cl_ord_id: str | None,
+    @staticmethod
+    def open_position(
+        position: SymbolPosition,
+        side: str,
+        amount_base: Decimal,
+        price: Decimal,
     ) -> None:
-        position = self.ensure_symbol(symbol)
-        position.protective_algo_id = algo_id
-        position.protective_algo_cl_ord_id = algo_cl_ord_id
-
-    def clear_protective_order(self, symbol: str | None = None) -> None:
-        position = self.ensure_symbol(symbol)
-        position.protective_algo_id = None
-        position.protective_algo_cl_ord_id = None
+        new_total_base = position.position_base + amount_base
+        if new_total_base > 0:
+            previous_cost = position.position_base * position.entry_price
+            new_cost = amount_base * price
+            position.entry_price = (previous_cost + new_cost) / new_total_base
+        position.position_base = new_total_base
+        position.side = side
 
     def clear_symbol_position(self, symbol: str | None = None) -> None:
         position = self.ensure_symbol(symbol)
         position.position_base = Decimal("0")
         position.entry_price = Decimal("0")
-        position.protective_algo_id = None
-        position.protective_algo_cl_ord_id = None
+        position.side = None

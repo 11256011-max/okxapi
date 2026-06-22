@@ -124,11 +124,11 @@ class EmaRsiStrategy:
 
 
 class SmcStrategy:
-    """Rule-based Smart Money Concepts strategy for spot long-only trading.
+    """Rule-based Smart Money Concepts strategy.
 
-    This is intentionally conservative: it looks for confirmed swing structure,
-    break of structure, a recent bullish order block, and optionally a fair
-    value gap. It does not attempt to short because this bot is spot-only.
+    It looks for confirmed swing structure, break of structure, recent bullish
+    order blocks, and optionally fair value gaps. In swap mode, bullish signals
+    open longs and bearish signals open shorts or close existing longs.
     """
 
     def __init__(self, config: BotConfig) -> None:

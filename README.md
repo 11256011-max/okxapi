@@ -1,6 +1,6 @@
 # OKX API 交易機器人
 
-這是一個可執行的 OKX 現貨交易機器人 starter 專案。它可以讀取 K 線資料、產生交易訊號、套用風控，並依照設定執行 dry-run、OKX 模擬盤或真實交易。
+這是一個可執行的 OKX USDT 永續合約交易機器人 starter 專案。它可以讀取 K 線資料、產生交易訊號、套用風控，並依照設定執行 dry-run、OKX 模擬盤或真實交易。
 
 > 重要：這不是投資建議，也不保證獲利。預設是 `DRY_RUN=true`，不會送出訂單。請先用 dry-run 和模擬盤驗證，再考慮小資金測試。
 
@@ -8,7 +8,7 @@
 
 - 預設 dry-run，不會下單。
 - 預設 OKX 模擬交易模式。
-- 僅支援現貨交易，槓桿固定為 1。
+- 僅支援 USDT 永續合約；可做多、做空，並依風險計算槓桿。
 - 不包含提幣、轉帳或資金劃轉功能。
 - 真實交易必須同時設定 `DRY_RUN=false`、`OKX_SIMULATED_TRADING=false`、`ENABLE_LIVE_TRADING=true`。
 - API 權限請只開「讀取」與「交易」，不要開「提幣」。
@@ -144,7 +144,7 @@ RSI_SELL_MIN=70
 
 ## SMC 策略
 
-SMC 是 Smart Money Concepts 的簡化規則版。這個 bot 的 SMC 策略是「現貨多單版」，不做放空。
+SMC 是 Smart Money Concepts 的簡化規則版。`buy` 訊號可開多或平空，`sell` 訊號可開空或平多。
 
 它會觀察：
 
@@ -190,39 +190,54 @@ SMC_REQUIRE_FVG=false
 ```env
 ORDER_QUOTE_AMOUNT=10
 MAX_QUOTE_PER_ORDER=10
-MAX_DAILY_NOTIONAL=50
+MARKET_TYPE=swap
+MARGIN_MODE=isolated
+POSITION_MODE=net
+RISK_PER_TRADE_PCT=0.01
+DAILY_MAX_LOSS_PCT=0.06
+MAX_LEVERAGE=10
 STOP_LOSS_PCT=0.02
 TAKE_PROFIT_PCT=0.04
 ATTACH_TP_SL=true
 SELL_FRACTION=1
 ```
 
-- `ORDER_QUOTE_AMOUNT`：每次買入多少 quote currency，通常是 USDT。
-- `MAX_QUOTE_PER_ORDER`：單筆最大交易額。
-- `MAX_DAILY_NOTIONAL`：每日最大累計交易額。
+- `ORDER_QUOTE_AMOUNT`：單筆保證金預算上限。
+- `MAX_QUOTE_PER_ORDER`：單筆最大保證金。
+- `MARKET_TYPE`：固定使用 `swap`，本專案不送現貨單。
+- `MARGIN_MODE`：合約保證金模式，建議先用 `isolated`。
+- `POSITION_MODE`：`net` 是單向持倉；如果 OKX 帳戶是雙向持倉，改成 `hedge`。
+- `RISK_PER_TRADE_PCT`：單筆最大風險，`0.01` 代表總權益的 1%。
+- `DAILY_MAX_LOSS_PCT`：日內已實現虧損上限，`0.06` 代表總權益的 6%。
+- `MAX_LEVERAGE`：程式自動計算槓桿後的最高上限。
 - `STOP_LOSS_PCT`：停損百分比。
 - `TAKE_PROFIT_PCT`：停利百分比。
-- `ATTACH_TP_SL`：買入成交後，是否在 OKX 掛 OCO 止盈 / 止損 algo 單。
+- `ATTACH_TP_SL`：是否在 OKX 掛止盈 / 止損保護單。
 - `SELL_FRACTION`：賣出比例，`1` 代表全部賣出。
 
 ## OKX 原生止盈 / 止損
 
-當 `ATTACH_TP_SL=true` 且 `DRY_RUN=false` 時，bot 買入成交後會立刻在 OKX 掛一張 `ordType=oco` 的賣出 algo 單：
+當 `ATTACH_TP_SL=true` 且 `DRY_RUN=false` 時，bot 送出開倉市價單時會同時帶上 OKX / CCXT 支援的 `takeProfit` 和 `stopLoss` 附加參數，讓 OKX 端保存止盈與止損條件單：
 
-- 止盈觸發價：`entry_price * (1 + TAKE_PROFIT_PCT)`
-- 止損觸發價：`entry_price * (1 - STOP_LOSS_PCT)`
-- 止盈和止損都使用市價執行，也就是 OKX API 的 `tpOrdPx=-1` 和 `slOrdPx=-1`
+- 多單止盈觸發價：`entry_price * (1 + TAKE_PROFIT_PCT)`
+- 多單止損觸發價：`entry_price * (1 - STOP_LOSS_PCT)`
+- 空單止盈觸發價：`entry_price * (1 - TAKE_PROFIT_PCT)`
+- 空單止損觸發價：`entry_price * (1 + STOP_LOSS_PCT)`
+- 止盈和止損都使用市價執行。
 
-例如買入價是 `64000`：
+例如多單入場價是 `64000`：
 
 ```text
 STOP_LOSS_PCT=0.02   -> 止損觸發價 62720
 TAKE_PROFIT_PCT=0.04 -> 止盈觸發價 66560
 ```
 
-如果後續策略出現結構賣出訊號，bot 會先取消原本的 OCO 保護單，再送出市價賣出，避免重複賣出。
+例如空單入場價是 `64000`：
 
-如果 OKX OCO 掛單失敗，bot 會記錄錯誤，並保留程式內部的停利 / 停損監控作為備援。
+```text
+STOP_LOSS_PCT=0.02   -> 止損觸發價 65280
+TAKE_PROFIT_PCT=0.04 -> 止盈觸發價 61440
+```
 
 ## 參考
 

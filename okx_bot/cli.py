@@ -9,7 +9,7 @@ from .config import BotConfig, ConfigError
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="OKX spot trading bot")
+    parser = argparse.ArgumentParser(description="OKX trading bot")
     parser.add_argument(
         "command",
         choices=("once", "loop", "balance"),
@@ -57,4 +57,3 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         logging.exception("Bot stopped because of an unexpected error.")
         return 1
-

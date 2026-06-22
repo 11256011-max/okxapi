@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-import time
+from dataclasses import dataclass
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
@@ -11,6 +11,16 @@ from .models import Candle, Signal
 from .risk import RiskError, RiskManager
 from .state import BotState
 from .strategy import create_strategy
+
+
+@dataclass(frozen=True)
+class SwapPositionPlan:
+    equity: Decimal
+    risk_amount: Decimal
+    margin_budget: Decimal
+    notional: Decimal
+    leverage: int
+    amount_contracts: Decimal
 
 
 class TradingBot:
@@ -24,7 +34,6 @@ class TradingBot:
     def run_once(self) -> None:
         self.state.reset_daily_if_needed()
         for symbol in self.config.symbols:
-            self.ensure_protective_order_for_position(symbol)
             try:
                 candles = self.fetch_candles(symbol)
             except Exception as exc:
@@ -71,12 +80,12 @@ class TradingBot:
         return candles
 
     def apply_position_risk(self, symbol: str, signal: Signal) -> Signal:
-        if self.config.attach_tp_sl and self.state.get_protective_algo_id(symbol) and not self.config.dry_run:
+        if self.config.attach_tp_sl and not self.config.dry_run:
             return signal
         if self.risk.stop_loss_hit(self.state, symbol, signal.price):
-            return Signal("sell", "Stop loss hit.", signal.price, signal.indicators, Decimal("1"))
+            return Signal(self.close_action_for_symbol(symbol), "Stop loss hit.", signal.price, signal.indicators, Decimal("1"))
         if self.risk.take_profit_hit(self.state, symbol, signal.price):
-            return Signal("sell", "Take profit hit.", signal.price, signal.indicators, Decimal("1"))
+            return Signal(self.close_action_for_symbol(symbol), "Take profit hit.", signal.price, signal.indicators, Decimal("1"))
         return signal
 
     def apply_signal_confidence_gate(self, signal: Signal) -> Signal:
@@ -105,304 +114,308 @@ class TradingBot:
         raise RuntimeError(f"Unknown signal action: {signal.action}")
 
     def buy(self, symbol: str, signal: Signal) -> None:
-        current_position = self.state.get_position_base(symbol)
-        if current_position > 0:
-            logging.info("Adding to existing position for %s: current base=%s", symbol, current_position)
-
-        try:
-            decision = self.risk.approve_buy(self.state)
-        except RiskError as exc:
-            logging.warning("Buy blocked by risk manager: %s", exc)
-            return
-
-        quote_amount = decision.quote_amount
-        amount_base = self.quantize_amount(quote_amount / signal.price)
-
-        if self.config.dry_run:
-            logging.info("[DRY RUN] Would buy about %s %s for %s quote.", amount_base, symbol, quote_amount)
-            self.state.record_trade("buy", amount_base, signal.price, quote_amount, mode="dry-run", symbol=symbol)
-            return
-
-        self.assert_order_submission_allowed()
-        free_quote = self.fetch_quote_free_balance(symbol)
-        if free_quote <= 0:
-            logging.warning("Buy skipped because no available quote balance is available.")
-            return
-        if quote_amount > free_quote:
-            logging.warning(
-                "Requested buy quote amount %s exceeds available quote balance %s; reducing order size.",
-                quote_amount,
-                free_quote,
-            )
-            quote_amount = free_quote
-            amount_base = self.quantize_amount(quote_amount / signal.price)
-            if amount_base <= 0:
-                logging.warning("Buy skipped because reduced order size is too small.")
-                return
-
-        base_balance_before = self.fetch_base_free_balance(symbol)
-
-        try:
-            order = self.create_market_buy(quote_amount, symbol)
-        except Exception as exc:
-            logging.warning("Buy failed due to order execution error: %s", exc)
-            return
-        order_id = str(order.get("id")) if isinstance(order, dict) else None
-        filled_base, average_price = self.resolve_buy_fill(
-            order=order,
-            symbol=symbol,
-            quote_amount=quote_amount,
-            base_balance_before=base_balance_before,
-            fallback_price=signal.price,
-        )
-
-        if filled_base <= 0 or average_price <= 0:
-            logging.warning(
-                "Buy order was submitted but no filled base balance could be confirmed yet; "
-                "skipping local position record and protective TP/SL for now. order_id=%s",
-                order_id,
-            )
-            return
-
-        self.state.record_trade(
-            "buy",
-            filled_base,
-            average_price,
-            quote_amount,
-            mode=self.execution_mode,
-            order_id=order_id,
-            symbol=symbol,
-        )
-        logging.info("Buy submitted: %s", order)
-
-        try:
-            self.place_protective_order_after_buy(filled_base, average_price, symbol)
-        except Exception:
-            logging.exception("Failed to place protective OKX OCO TP/SL. Internal TP/SL monitor remains active.")
+        self.buy_swap(symbol, signal)
 
     def sell(self, symbol: str, signal: Signal) -> None:
-        amount_base = self.state.get_position_base(symbol)
-        if not self.config.dry_run:
-            free_base = self.fetch_base_free_balance(symbol)
-            if free_base <= 0:
-                logging.info(
-                    "Sell skipped for %s because no free base balance is available. Clearing local position state.",
-                    symbol,
-                )
-                self.state.clear_symbol_position(symbol)
-                return
-            if amount_base <= 0:
-                amount_base = free_base
-            else:
-                amount_base = min(amount_base, free_base)
-        amount_base = self.quantize_amount(amount_base * self.config.sell_fraction)
+        self.sell_swap(symbol, signal)
 
-        if amount_base <= 0:
-            logging.info("Sell skipped because no base balance is available.")
+    def buy_swap(self, symbol: str, signal: Signal) -> None:
+        position_side = self.state.get_position_side(symbol)
+        if position_side == "short":
+            self.close_swap_position(symbol, signal, order_side="buy")
+            return
+        if position_side == "long":
+            logging.info("Swap buy skipped because %s already has an open long position.", symbol)
+            return
+        self.open_swap_position(symbol, signal, position_side="long", order_side="buy")
+
+    def sell_swap(self, symbol: str, signal: Signal) -> None:
+        position_side = self.state.get_position_side(symbol)
+        if position_side == "long":
+            self.close_swap_position(symbol, signal, order_side="sell")
+            return
+        if position_side == "short":
+            logging.info("Swap sell skipped because %s already has an open short position.", symbol)
+            return
+        self.open_swap_position(symbol, signal, position_side="short", order_side="sell")
+
+    def open_swap_position(
+        self,
+        symbol: str,
+        signal: Signal,
+        position_side: str,
+        order_side: str,
+    ) -> None:
+        try:
+            plan = self.build_swap_position_plan(symbol, signal.price)
+            self.assert_daily_loss_limit_not_hit(plan.equity)
+        except RiskError as exc:
+            logging.warning("Swap %s blocked by risk manager: %s", order_side, exc)
             return
 
-        quote_notional = amount_base * signal.price
+        take_profit_price, stop_loss_price = self.exit_prices(signal.price, position_side)
 
         if self.config.dry_run:
-            logging.info("[DRY RUN] Would sell %s %s.", amount_base, symbol)
-            self.state.record_trade("sell", amount_base, signal.price, quote_notional, mode="dry-run", symbol=symbol)
+            logging.info(
+                "[DRY RUN] Would open %s %s: contracts=%s notional=%s margin_budget=%s leverage=%sx risk_amount=%s TP=%s SL=%s.",
+                symbol,
+                position_side,
+                plan.amount_contracts,
+                plan.notional,
+                plan.margin_budget,
+                plan.leverage,
+                plan.risk_amount,
+                take_profit_price,
+                stop_loss_price,
+            )
+            self.state.record_trade(
+                order_side,
+                plan.amount_contracts,
+                signal.price,
+                plan.notional,
+                mode="dry-run",
+                symbol=symbol,
+                position_side=position_side,
+            )
             return
 
         self.assert_order_submission_allowed()
-        self.cancel_protective_order_if_present(symbol)
-        order = self.exchange.create_market_sell_order(
-            symbol,
-            float(amount_base),
-            params={"tdMode": "cash"},
-        )
+        try:
+            self.set_swap_leverage(symbol, plan.leverage, position_side)
+            order = self.create_swap_market_order_with_tp_sl(
+                symbol,
+                plan.amount_contracts,
+                signal.price,
+                order_side=order_side,
+                position_side=position_side,
+            )
+        except Exception as exc:
+            logging.warning("Swap %s failed due to order execution error: %s", order_side, exc)
+            return
+
         average_price = self.decimal_from_order(order, "average", signal.price)
         order_id = str(order.get("id")) if isinstance(order, dict) else None
         self.state.record_trade(
-            "sell",
-            amount_base,
-            average_price,
+            order_side,
+            plan.amount_contracts,
+            average_price or signal.price,
+            plan.notional,
+            mode=self.execution_mode,
+            order_id=order_id,
+            symbol=symbol,
+            position_side=position_side,
+        )
+        logging.info("Swap %s submitted with attached TP/SL: %s", position_side, order)
+
+    def close_swap_position(self, symbol: str, signal: Signal, order_side: str) -> None:
+        position_side = self.state.get_position_side(symbol)
+        amount_contracts = self.state.get_position_base(symbol)
+        amount_contracts = self.quantize_amount(amount_contracts * self.config.sell_fraction)
+        if amount_contracts <= 0:
+            logging.info("Swap close skipped because no local %s position is recorded.", symbol)
+            return
+
+        if self.config.dry_run:
+            quote_notional = self.contract_notional(symbol, amount_contracts, signal.price)
+            realized_pnl = self.calculate_swap_pnl(symbol, amount_contracts, signal.price)
+            logging.info("[DRY RUN] Would close %s %s contracts=%s realized_pnl=%s.", symbol, position_side, amount_contracts, realized_pnl)
+            self.state.record_trade(
+                order_side,
+                amount_contracts,
+                signal.price,
+                quote_notional,
+                mode="dry-run",
+                symbol=symbol,
+                position_side=position_side,
+                reduce_only=True,
+                realized_pnl=realized_pnl,
+            )
+            return
+
+        self.assert_order_submission_allowed()
+        try:
+            order = self.exchange.create_order(
+                symbol,
+                "market",
+                order_side,
+                float(amount_contracts),
+                None,
+                params=self.swap_order_params(position_side, reduce_only=True),
+            )
+        except Exception as exc:
+            logging.warning("Swap close failed due to order execution error: %s", exc)
+            return
+
+        average_price = self.decimal_from_order(order, "average", signal.price)
+        close_price = average_price or signal.price
+        quote_notional = self.contract_notional(symbol, amount_contracts, close_price)
+        realized_pnl = self.calculate_swap_pnl(symbol, amount_contracts, close_price)
+        order_id = str(order.get("id")) if isinstance(order, dict) else None
+        self.state.record_trade(
+            order_side,
+            amount_contracts,
+            close_price,
             quote_notional,
             mode=self.execution_mode,
             order_id=order_id,
             symbol=symbol,
+            position_side=position_side,
+            reduce_only=True,
+            realized_pnl=realized_pnl,
         )
-        logging.info("Sell submitted: %s", order)
+        logging.info("Swap %s close submitted: %s", position_side, order)
 
-    def place_protective_order_after_buy(self, amount_base: Decimal, entry_price: Decimal, symbol: str) -> None:
-        if not self.config.attach_tp_sl:
-            return
-        if amount_base <= 0 or entry_price <= 0:
-            logging.warning("Protective TP/SL skipped because filled amount or entry price is invalid.")
-            return
-        if self.config.dry_run:
-            take_profit_price, stop_loss_price = self.exit_prices(entry_price)
-            logging.info(
-                "[DRY RUN] Would place OKX OCO TP/SL for %s: amount=%s take_profit=%s stop_loss=%s.",
-                symbol,
-                amount_base,
-                take_profit_price,
-                stop_loss_price,
-            )
-            return
+    def build_swap_position_plan(self, symbol: str, entry_price: Decimal) -> SwapPositionPlan:
+        if entry_price <= 0:
+            raise RiskError("Entry price must be greater than 0.")
 
-        available_base = self.wait_for_available_base(symbol, amount_base)
-        if available_base <= 0:
-            logging.warning("Protective TP/SL skipped because no available %s balance was confirmed.", symbol)
-            return
+        equity = self.fetch_account_equity()
+        if equity <= 0:
+            raise RiskError("Account equity is unavailable or zero.")
 
-        protect_amount = self.quantize_amount(min(amount_base, available_base))
-        if protect_amount <= 0:
-            logging.warning("Protective TP/SL skipped because available %s amount is too small.", symbol)
-            return
+        risk_amount = equity * self.config.risk_per_trade_pct
+        max_notional_by_risk = risk_amount / self.config.stop_loss_pct
+        margin_budget = min(self.config.order_quote_amount, self.config.max_quote_per_order, max_notional_by_risk)
+        if margin_budget <= 0:
+            raise RiskError("Margin budget is zero.")
 
-        payload = self.build_protective_oco_payload(protect_amount, entry_price, symbol)
-        response = self.exchange.private_post_trade_order_algo(payload)
-        algo_id, algo_cl_ord_id = self.extract_algo_identifiers(response, payload.get("algoClOrdId"))
-        self.state.set_protective_order(symbol, algo_id, algo_cl_ord_id)
-        logging.info("Protective OKX OCO TP/SL submitted: %s", response)
+        needed_leverage = self.ceil_decimal(max_notional_by_risk / margin_budget)
+        leverage = max(1, min(self.config.max_leverage, needed_leverage))
+        notional = min(max_notional_by_risk, margin_budget * Decimal(leverage))
+        amount_contracts = self.contract_amount_from_notional(symbol, notional, entry_price)
+        if amount_contracts <= 0:
+            raise RiskError("Calculated contract amount is too small.")
 
-    def ensure_protective_order_for_position(self, symbol: str) -> None:
-        if self.config.dry_run or not self.config.attach_tp_sl:
-            return
-        if self.state.get_protective_algo_id(symbol):
-            return
+        actual_notional = self.contract_notional(symbol, amount_contracts, entry_price)
+        return SwapPositionPlan(
+            equity=equity,
+            risk_amount=risk_amount,
+            margin_budget=margin_budget,
+            notional=actual_notional,
+            leverage=leverage,
+            amount_contracts=amount_contracts,
+        )
 
-        position_base = self.state.get_position_base(symbol)
-        entry_price = self.state.get_entry_price(symbol)
-        if position_base <= 0 or entry_price <= 0:
-            return
-
-        try:
-            self.place_protective_order_after_buy(position_base, entry_price, symbol)
-            logging.info("Protective OKX OCO TP/SL restored for existing %s position.", symbol)
-        except Exception:
-            logging.exception("Failed to restore protective OKX OCO TP/SL for existing %s position.", symbol)
-
-    def resolve_buy_fill(
+    def create_swap_market_order_with_tp_sl(
         self,
-        order: dict[str, Any],
         symbol: str,
-        quote_amount: Decimal,
-        base_balance_before: Decimal,
-        fallback_price: Decimal,
-    ) -> tuple[Decimal, Decimal]:
-        order_id = str(order.get("id")) if isinstance(order, dict) and order.get("id") else None
-        for attempt in range(8):
-            fetched_order = self.fetch_order_safely(order_id, symbol)
-            filled_base = self.decimal_from_order(fetched_order, "filled", Decimal("0"))
-            average_price = self.decimal_from_order(fetched_order, "average", Decimal("0"))
-            if filled_base > 0 and average_price > 0:
-                return self.quantize_amount(filled_base), average_price
+        amount_contracts: Decimal,
+        entry_price: Decimal,
+        order_side: str,
+        position_side: str,
+    ) -> dict[str, Any]:
+        take_profit_price, stop_loss_price = self.exit_prices(entry_price, position_side)
+        params = self.swap_order_params(position_side)
+        if self.config.attach_tp_sl:
+            params["takeProfit"] = {
+                "triggerPrice": float(take_profit_price),
+                "type": "market",
+                "triggerPriceType": "last",
+            }
+            params["stopLoss"] = {
+                "triggerPrice": float(stop_loss_price),
+                "type": "market",
+                "triggerPriceType": "last",
+            }
 
-            base_balance_after = self.fetch_base_free_balance(symbol)
-            balance_delta = base_balance_after - base_balance_before
-            if balance_delta > 0:
-                average_from_cost = quote_amount / balance_delta
-                return self.quantize_amount(balance_delta), average_price or average_from_cost or fallback_price
+        return self.exchange.create_order(
+            symbol,
+            "market",
+            order_side,
+            float(amount_contracts),
+            None,
+            params=params,
+        )
 
-            if attempt < 7:
-                time.sleep(0.5)
+    def assert_daily_loss_limit_not_hit(self, equity: Decimal) -> None:
+        daily_loss_limit = equity * self.config.daily_max_loss_pct
+        if self.state.daily_realized_pnl <= -daily_loss_limit:
+            raise RiskError(
+                f"Daily realized loss limit reached: {self.state.daily_realized_pnl} <= -{daily_loss_limit}"
+            )
 
-        return Decimal("0"), Decimal("0")
-
-    def fetch_order_safely(self, order_id: str | None, symbol: str) -> dict[str, Any]:
-        if not order_id:
-            return {}
-        try:
-            order = self.exchange.fetch_order(order_id, symbol)
-            return order if isinstance(order, dict) else {}
-        except Exception:
-            return {}
-
-    def wait_for_available_base(self, symbol: str, desired_amount: Decimal) -> Decimal:
-        for attempt in range(8):
-            available_base = self.fetch_base_free_balance(symbol)
-            if available_base >= desired_amount or (available_base > 0 and attempt >= 2):
-                return available_base
-            if attempt < 7:
-                time.sleep(0.5)
-        return self.fetch_base_free_balance(symbol)
-
-    def build_protective_oco_payload(self, amount_base: Decimal, entry_price: Decimal, symbol: str) -> dict[str, str]:
-        take_profit_price, stop_loss_price = self.exit_prices(entry_price)
-        self.exchange.load_markets()
-        market = self.exchange.market(symbol)
-        inst_id = market["id"]
-        amount = self.exchange.amount_to_precision(symbol, float(amount_base))
-        take_profit = self.exchange.price_to_precision(symbol, float(take_profit_price))
-        stop_loss = self.exchange.price_to_precision(symbol, float(stop_loss_price))
-
-        return {
-            "instId": inst_id,
-            "tdMode": "cash",
-            "side": "sell",
-            "ordType": "oco",
-            "sz": amount,
-            "tpTriggerPx": take_profit,
-            "tpOrdPx": "-1",
-            "tpTriggerPxType": "last",
-            "slTriggerPx": stop_loss,
-            "slOrdPx": "-1",
-            "slTriggerPxType": "last",
-            "algoClOrdId": self.new_algo_client_id(),
-        }
-
-    def cancel_protective_order_if_present(self, symbol: str) -> None:
-        algo_id = self.state.get_protective_algo_id(symbol)
-        if not algo_id:
-            return
+    def calculate_swap_pnl(self, symbol: str, amount_contracts: Decimal, exit_price: Decimal) -> Decimal:
+        entry_price = self.state.get_entry_price(symbol)
+        position_side = self.state.get_position_side(symbol)
+        if entry_price <= 0 or amount_contracts <= 0:
+            return Decimal("0")
 
         self.exchange.load_markets()
         market = self.exchange.market(symbol)
-        payload = [{"algoId": algo_id, "instId": market["id"]}]
-        try:
-            response = self.exchange.private_post_trade_cancel_algos(payload)
-            logging.info("Protective OKX OCO TP/SL canceled before market sell: %s", response)
-            self.state.clear_protective_order(symbol)
-        except Exception:
-            logging.exception("Failed to cancel protective OKX OCO TP/SL before market sell.")
+        contract_size = Decimal(str(market.get("contractSize") or "1"))
+        if position_side == "short":
+            return (entry_price - exit_price) * amount_contracts * contract_size
+        return (exit_price - entry_price) * amount_contracts * contract_size
 
-    def exit_prices(self, entry_price: Decimal) -> tuple[Decimal, Decimal]:
+    def set_swap_leverage(self, symbol: str, leverage: int, position_side: str) -> None:
+        params: dict[str, Any] = {"mgnMode": self.config.margin_mode}
+        if self.config.position_mode == "hedge":
+            params["posSide"] = position_side
+        self.exchange.set_leverage(
+            leverage,
+            symbol,
+            params=params,
+        )
+
+    def swap_order_params(self, position_side: str | None = None, reduce_only: bool = False) -> dict[str, Any]:
+        params: dict[str, Any] = {"tdMode": self.config.margin_mode}
+        if reduce_only:
+            params["reduceOnly"] = True
+        if self.config.position_mode == "hedge" and position_side in {"long", "short"}:
+            params["positionSide"] = position_side
+        return params
+
+    def contract_amount_from_notional(self, symbol: str, notional: Decimal, price: Decimal) -> Decimal:
+        self.exchange.load_markets()
+        market = self.exchange.market(symbol)
+        contract_size = Decimal(str(market.get("contractSize") or "1"))
+        raw_amount = notional / (price * contract_size)
+        precise_amount = self.exchange.amount_to_precision(symbol, float(raw_amount))
+        return Decimal(str(precise_amount))
+
+    def contract_notional(self, symbol: str, amount_contracts: Decimal, price: Decimal) -> Decimal:
+        self.exchange.load_markets()
+        market = self.exchange.market(symbol)
+        contract_size = Decimal(str(market.get("contractSize") or "1"))
+        return amount_contracts * contract_size * price
+
+    def fetch_account_equity(self) -> Decimal:
+        balance = self.exchange.fetch_balance(params={"type": self.config.market_type})
+        info = balance.get("info", {})
+        data = info.get("data") if isinstance(info, dict) else None
+        if isinstance(data, list) and data:
+            total_eq = data[0].get("totalEq")
+            if total_eq not in (None, ""):
+                return Decimal(str(total_eq))
+
+        total = balance.get("total", {})
+        free = balance.get("free", {})
+        for source in (total, free):
+            value = source.get("USDT") if isinstance(source, dict) else None
+            if value not in (None, ""):
+                return Decimal(str(value))
+        return Decimal("0")
+
+    def close_action_for_symbol(self, symbol: str) -> str:
+        return "buy" if self.state.get_position_side(symbol) == "short" else "sell"
+
+    def exit_prices(self, entry_price: Decimal, position_side: str = "long") -> tuple[Decimal, Decimal]:
+        if position_side == "short":
+            take_profit_price = entry_price * (Decimal("1") - self.config.take_profit_pct)
+            stop_loss_price = entry_price * (Decimal("1") + self.config.stop_loss_pct)
+            return take_profit_price, stop_loss_price
         take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct)
         stop_loss_price = entry_price * (Decimal("1") - self.config.stop_loss_pct)
         return take_profit_price, stop_loss_price
 
-    def create_market_buy(self, quote_amount: Decimal, symbol: str) -> dict[str, Any]:
-        if hasattr(self.exchange, "create_market_buy_order_with_cost"):
-            return self.exchange.create_market_buy_order_with_cost(
-                symbol,
-                float(quote_amount),
-                params={"tdMode": "cash"},
-            )
-        ticker = self.exchange.fetch_ticker(symbol)
-        last_price = Decimal(str(ticker["last"]))
-        amount_base = self.quantize_amount(quote_amount / last_price)
-        return self.exchange.create_market_buy_order(
-            symbol,
-            float(amount_base),
-            params={"tdMode": "cash"},
-        )
-
     def print_balance(self) -> None:
         self.config.validate(require_private=True)
-        balance = self.exchange.fetch_balance()
+        balance = self.exchange.fetch_balance(params={"type": self.config.market_type})
         total = balance.get("total", {})
         free = balance.get("free", {})
         for currency, total_amount in sorted(total.items()):
             if total_amount:
                 logging.info("%s total=%s free=%s", currency, total_amount, free.get(currency))
-
-    def fetch_quote_free_balance(self, symbol: str) -> Decimal:
-        quote_currency = symbol.split("/")[1]
-        balance = self.exchange.fetch_balance()
-        free = balance.get("free", {})
-        return Decimal(str(free.get(quote_currency, "0") or "0"))
-
-    def fetch_base_free_balance(self, symbol: str) -> Decimal:
-        base_currency = symbol.split("/")[0]
-        balance = self.exchange.fetch_balance()
-        free = balance.get("free", {})
-        return Decimal(str(free.get(base_currency, "0") or "0"))
 
     def assert_order_submission_allowed(self) -> None:
         if self.config.dry_run:
@@ -429,18 +442,9 @@ class TradingBot:
         return value.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
 
     @staticmethod
-    def extract_algo_identifiers(response: Any, fallback_algo_cl_ord_id: str | None) -> tuple[str | None, str | None]:
-        if isinstance(response, dict):
-            data = response.get("data")
-            if isinstance(data, list) and data:
-                first = data[0]
-                if isinstance(first, dict):
-                    return first.get("algoId") or None, first.get("algoClOrdId") or fallback_algo_cl_ord_id
-        return None, fallback_algo_cl_ord_id
-
-    @staticmethod
-    def new_algo_client_id() -> str:
-        return f"codex{int(time.time() * 1000)}"[:32]
+    def ceil_decimal(value: Decimal) -> int:
+        rounded = int(value)
+        return rounded if value == Decimal(rounded) else rounded + 1
 
     @staticmethod
     def format_confidence(value: Decimal) -> str:

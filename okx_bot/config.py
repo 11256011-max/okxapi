@@ -49,6 +49,14 @@ def env_probability(name: str, default: str) -> Decimal:
     return value
 
 
+def normalize_symbol(symbol: str, market_type: str) -> str:
+    if market_type == "swap" and ":" not in symbol:
+        base_quote = symbol.split("/")
+        if len(base_quote) == 2:
+            return f"{symbol}:{base_quote[1]}"
+    return symbol
+
+
 @dataclass(frozen=True)
 class BotConfig:
     api_key: str
@@ -62,7 +70,11 @@ class BotConfig:
     candle_limit: int
     poll_seconds: int
     market_type: str
-    leverage: Decimal
+    margin_mode: str
+    position_mode: str
+    risk_per_trade_pct: Decimal
+    daily_max_loss_pct: Decimal
+    max_leverage: int
     strategy: str
     signal_confidence_threshold: Decimal
     fast_ema: int
@@ -77,7 +89,6 @@ class BotConfig:
     smc_require_fvg: bool
     order_quote_amount: Decimal
     max_quote_per_order: Decimal
-    max_daily_notional: Decimal
     stop_loss_pct: Decimal
     take_profit_pct: Decimal
     attach_tp_sl: bool
@@ -90,7 +101,8 @@ class BotConfig:
         symbols_raw = os.getenv("SYMBOLS", "")
         if not symbols_raw:
             symbols_raw = os.getenv("SYMBOL", "BTC/USDT")
-        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
+        market_type = os.getenv("MARKET_TYPE", "swap").strip().lower()
+        symbols = [normalize_symbol(s.strip().upper(), market_type) for s in symbols_raw.split(",") if s.strip()]
         return cls(
             api_key=os.getenv("OKX_API_KEY", "").strip(),
             secret_key=os.getenv("OKX_SECRET_KEY", "").strip(),
@@ -102,8 +114,12 @@ class BotConfig:
             timeframe=os.getenv("TIMEFRAME", "1m").strip(),
             candle_limit=env_int("CANDLE_LIMIT", 200),
             poll_seconds=env_int("POLL_SECONDS", 60),
-            market_type=os.getenv("MARKET_TYPE", "spot").strip().lower(),
-            leverage=env_decimal("LEVERAGE", "1"),
+            market_type=market_type,
+            margin_mode=os.getenv("MARGIN_MODE", "isolated").strip().lower(),
+            position_mode=os.getenv("POSITION_MODE", "net").strip().lower(),
+            risk_per_trade_pct=env_probability("RISK_PER_TRADE_PCT", "0.01"),
+            daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
+            max_leverage=env_int("MAX_LEVERAGE", 10),
             strategy=os.getenv("STRATEGY", "ema_rsi").strip().lower(),
             signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"),
             fast_ema=env_int("FAST_EMA", 9),
@@ -118,7 +134,6 @@ class BotConfig:
             smc_require_fvg=env_bool("SMC_REQUIRE_FVG", False),
             order_quote_amount=env_decimal("ORDER_QUOTE_AMOUNT", "10"),
             max_quote_per_order=env_decimal("MAX_QUOTE_PER_ORDER", "10"),
-            max_daily_notional=env_decimal("MAX_DAILY_NOTIONAL", "50"),
             stop_loss_pct=env_decimal("STOP_LOSS_PCT", "0.02"),
             take_profit_pct=env_decimal("TAKE_PROFIT_PCT", "0.04"),
             attach_tp_sl=env_bool("ATTACH_TP_SL", True),
@@ -131,10 +146,18 @@ class BotConfig:
         return bool(self.api_key and self.secret_key and self.passphrase)
 
     def validate(self, require_private: bool = False) -> None:
-        if self.market_type != "spot":
-            raise ConfigError("This starter bot is spot-only. Keep MARKET_TYPE=spot.")
-        if self.leverage != Decimal("1"):
-            raise ConfigError("This starter bot does not use leverage. Keep LEVERAGE=1.")
+        if self.market_type != "swap":
+            raise ConfigError("This bot is swap-only. Set MARKET_TYPE=swap.")
+        if self.margin_mode not in {"isolated", "cross"}:
+            raise ConfigError("MARGIN_MODE must be isolated or cross.")
+        if self.position_mode not in {"net", "hedge"}:
+            raise ConfigError("POSITION_MODE must be net or hedge.")
+        if not Decimal("0") < self.risk_per_trade_pct <= Decimal("1"):
+            raise ConfigError("RISK_PER_TRADE_PCT must be between 0 and 1, or 0 and 100 percent.")
+        if not Decimal("0") < self.daily_max_loss_pct <= Decimal("1"):
+            raise ConfigError("DAILY_MAX_LOSS_PCT must be between 0 and 1, or 0 and 100 percent.")
+        if self.max_leverage < 1:
+            raise ConfigError("MAX_LEVERAGE must be at least 1.")
         if self.strategy not in {"ema_rsi", "smc"}:
             raise ConfigError("STRATEGY must be one of: ema_rsi, smc.")
         if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
@@ -160,12 +183,12 @@ class BotConfig:
             raise ConfigError("SYMBOLS is required and must include at least one market symbol like BTC/USDT.")
         if any("/" not in symbol for symbol in self.symbols):
             raise ConfigError("SYMBOLS must be a comma-separated list of market symbols like BTC/USDT.")
-        if any(symbol.split("/")[1] != "USDT" for symbol in self.symbols):
+        if any(symbol.split("/")[1].split(":")[0] != "USDT" for symbol in self.symbols):
             raise ConfigError("All SYMBOLS must use USDT as the quote currency.")
         if self.order_quote_amount <= 0:
             raise ConfigError("ORDER_QUOTE_AMOUNT must be greater than 0.")
-        if self.max_quote_per_order <= 0 or self.max_daily_notional <= 0:
-            raise ConfigError("MAX_QUOTE_PER_ORDER and MAX_DAILY_NOTIONAL must be greater than 0.")
+        if self.max_quote_per_order <= 0:
+            raise ConfigError("MAX_QUOTE_PER_ORDER must be greater than 0.")
         if self.order_quote_amount > self.max_quote_per_order:
             raise ConfigError("ORDER_QUOTE_AMOUNT cannot exceed MAX_QUOTE_PER_ORDER.")
         if not Decimal("0") < self.sell_fraction <= Decimal("1"):

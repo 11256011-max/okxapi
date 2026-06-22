@@ -6,36 +6,82 @@ from unittest.mock import patch
 from okx_bot.bot import TradingBot
 from okx_bot.config import BotConfig
 from okx_bot.models import Signal
+from okx_bot.risk import RiskError
 from okx_bot.state import BotState
 
 
 class FakeExchange:
-    def __init__(self) -> None:
-        self.cancel_payload = None
+    def __init__(self, equity: str = "10000") -> None:
+        self.equity = equity
+        self.orders = []
+        self.leverage_calls = []
 
     def load_markets(self) -> None:
         return None
 
     def market(self, symbol: str) -> dict[str, str]:
-        return {"id": symbol.replace("/", "-")}
+        return {"id": symbol.replace("/", "-").replace(":", "-"), "contractSize": "1"}
 
     def amount_to_precision(self, symbol: str, amount: float) -> str:
         return f"{amount:.8f}".rstrip("0").rstrip(".")
 
-    def price_to_precision(self, symbol: str, price: float) -> str:
-        return f"{price:.2f}"
+    def fetch_balance(self, params=None):
+        return {
+            "info": {"data": [{"totalEq": self.equity}]},
+            "total": {"USDT": self.equity},
+            "free": {"USDT": self.equity},
+        }
 
-    def private_post_trade_cancel_algos(self, payload):
-        self.cancel_payload = payload
-        return {"code": "0", "data": [{"algoId": payload[0]["algoId"], "sCode": "0"}]}
+    def set_leverage(self, leverage: int, symbol: str, params=None):
+        self.leverage_calls.append((leverage, symbol, params or {}))
+        return {"code": "0"}
+
+    def create_order(self, symbol: str, order_type: str, side: str, amount: float, price, params=None):
+        order = {
+            "id": f"order-{len(self.orders) + 1}",
+            "symbol": symbol,
+            "type": order_type,
+            "side": side,
+            "amount": amount,
+            "price": price,
+            "average": None,
+            "params": params or {},
+        }
+        self.orders.append(order)
+        return order
+
+
+def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
+    env = {
+        "MARKET_TYPE": "swap",
+        "SYMBOL": "BTC/USDT",
+        "ORDER_QUOTE_AMOUNT": "1000",
+        "MAX_QUOTE_PER_ORDER": "1000",
+        "STOP_LOSS_PCT": "0.02",
+        "TAKE_PROFIT_PCT": "0.04",
+        "RISK_PER_TRADE_PCT": "0.01",
+        "DAILY_MAX_LOSS_PCT": "0.06",
+        "MAX_LEVERAGE": "10",
+    }
+    env.update(extra_env or {})
+    with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
+        config = BotConfig.from_env()
+        config.validate()
+        return config
+
+
+def make_bot(extra_env: dict[str, str] | None = None, equity: str = "10000") -> TradingBot:
+    config = make_config(extra_env)
+    bot = object.__new__(TradingBot)
+    bot.config = config
+    bot.exchange = FakeExchange(equity)
+    bot.state = BotState(default_symbol=config.symbols[0])
+    return bot
 
 
 class BotSignalGateTests(unittest.TestCase):
     def test_low_confidence_trade_signal_is_blocked(self) -> None:
-        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(
-            os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "0.80"}, clear=True
-        ):
-            config = BotConfig.from_env()
+        config = make_config({"SIGNAL_CONFIDENCE_THRESHOLD": "0.80"})
         bot_like = object.__new__(TradingBot)
         bot_like.config = config
         signal = Signal(
@@ -52,10 +98,7 @@ class BotSignalGateTests(unittest.TestCase):
         self.assertIn("below threshold", gated.reason)
 
     def test_high_confidence_trade_signal_is_allowed(self) -> None:
-        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(
-            os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "0.80"}, clear=True
-        ):
-            config = BotConfig.from_env()
+        config = make_config({"SIGNAL_CONFIDENCE_THRESHOLD": "0.80"})
         bot_like = object.__new__(TradingBot)
         bot_like.config = config
         signal = Signal(
@@ -71,41 +114,70 @@ class BotSignalGateTests(unittest.TestCase):
         self.assertEqual(gated.action, "buy")
 
 
-class BotProtectiveOrderTests(unittest.TestCase):
-    def make_bot(self) -> TradingBot:
-        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {}, clear=True):
-            config = BotConfig.from_env()
-        bot = object.__new__(TradingBot)
-        bot.config = config
-        bot.exchange = FakeExchange()
-        bot.state = BotState()
-        return bot
+class BotSwapRiskTests(unittest.TestCase):
+    def test_build_swap_position_plan_uses_one_percent_risk(self) -> None:
+        bot = make_bot()
 
-    def test_build_protective_oco_payload(self) -> None:
-        bot = self.make_bot()
+        plan = bot.build_swap_position_plan("BTC/USDT:USDT", Decimal("100"))
 
-        payload = bot.build_protective_oco_payload(Decimal("0.01"), Decimal("100"), "BTC/USDT")
+        self.assertEqual(plan.equity, Decimal("10000"))
+        self.assertEqual(plan.risk_amount, Decimal("100.00"))
+        self.assertEqual(plan.margin_budget, Decimal("1000"))
+        self.assertEqual(plan.notional, Decimal("5000"))
+        self.assertEqual(plan.leverage, 5)
+        self.assertEqual(plan.amount_contracts, Decimal("50"))
 
-        self.assertEqual(payload["instId"], "BTC-USDT")
-        self.assertEqual(payload["tdMode"], "cash")
-        self.assertEqual(payload["side"], "sell")
-        self.assertEqual(payload["ordType"], "oco")
-        self.assertEqual(payload["sz"], "0.01")
-        self.assertEqual(payload["tpTriggerPx"], "104.00")
-        self.assertEqual(payload["tpOrdPx"], "-1")
-        self.assertEqual(payload["slTriggerPx"], "98.00")
-        self.assertEqual(payload["slOrdPx"], "-1")
-        self.assertEqual(payload["tpTriggerPxType"], "last")
-        self.assertEqual(payload["slTriggerPxType"], "last")
+    def test_short_exit_prices_reverse_take_profit_and_stop_loss(self) -> None:
+        bot = make_bot()
 
-    def test_cancel_protective_order_uses_algo_id(self) -> None:
-        bot = self.make_bot()
-        bot.state.set_protective_order("BTC/USDT", "12345", "client123")
+        take_profit, stop_loss = bot.exit_prices(Decimal("100"), "short")
 
-        bot.cancel_protective_order_if_present("BTC/USDT")
+        self.assertEqual(take_profit, Decimal("96.00"))
+        self.assertEqual(stop_loss, Decimal("102.00"))
 
-        self.assertEqual(bot.exchange.cancel_payload, [{"algoId": "12345", "instId": "BTC-USDT"}])
-        self.assertIsNone(bot.state.get_protective_algo_id("BTC/USDT"))
+    def test_swap_order_attaches_short_take_profit_and_stop_loss(self) -> None:
+        bot = make_bot({"DRY_RUN": "false", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"})
+
+        order = bot.create_swap_market_order_with_tp_sl(
+            "BTC/USDT:USDT",
+            Decimal("2"),
+            Decimal("100"),
+            order_side="sell",
+            position_side="short",
+        )
+
+        self.assertEqual(order["side"], "sell")
+        self.assertEqual(order["params"]["tdMode"], "isolated")
+        self.assertEqual(order["params"]["takeProfit"]["triggerPrice"], 96.0)
+        self.assertEqual(order["params"]["stopLoss"]["triggerPrice"], 102.0)
+
+    def test_daily_loss_limit_blocks_new_positions(self) -> None:
+        bot = make_bot()
+        bot.state.daily_realized_pnl = Decimal("-600")
+
+        with self.assertRaises(RiskError):
+            bot.assert_daily_loss_limit_not_hit(Decimal("10000"))
+
+    def test_buy_signal_closes_existing_short(self) -> None:
+        bot = make_bot()
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade("sell", Decimal("2"), Decimal("100"), Decimal("200"), "dry-run", symbol=symbol, position_side="short")
+        signal = Signal("buy", "Close short.", Decimal("95"), {}, Decimal("1"))
+
+        bot.buy(symbol, signal)
+
+        self.assertIsNone(bot.state.get_position_side(symbol))
+        self.assertEqual(bot.state.daily_realized_pnl, Decimal("10"))
+
+    def test_sell_signal_opens_short_when_flat(self) -> None:
+        bot = make_bot()
+        symbol = "BTC/USDT:USDT"
+        signal = Signal("sell", "Open short.", Decimal("100"), {}, Decimal("1"))
+
+        bot.sell(symbol, signal)
+
+        self.assertEqual(bot.state.get_position_side(symbol), "short")
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("50"))
 
 
 if __name__ == "__main__":
