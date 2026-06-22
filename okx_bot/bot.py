@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from decimal import Decimal, ROUND_DOWN
 from typing import Any
 
@@ -61,6 +62,8 @@ class TradingBot:
         return candles
 
     def apply_position_risk(self, signal: Signal) -> Signal:
+        if self.config.attach_tp_sl and self.state.protective_algo_id and not self.config.dry_run:
+            return signal
         if self.risk.stop_loss_hit(self.state, signal.price):
             return Signal("sell", "Stop loss hit.", signal.price, signal.indicators, Decimal("1"))
         if self.risk.take_profit_hit(self.state, signal.price):
@@ -118,11 +121,25 @@ class TradingBot:
         order_id = str(order.get("id")) if isinstance(order, dict) else None
         self.state.record_trade("buy", filled_base, average_price, quote_amount, mode=self.execution_mode, order_id=order_id)
         logging.info("Buy submitted: %s", order)
+        try:
+            self.place_protective_order_after_buy(filled_base, average_price)
+        except Exception:
+            logging.exception("Failed to place protective OKX OCO TP/SL. Internal TP/SL monitor remains active.")
 
     def sell(self, signal: Signal) -> None:
         amount_base = self.state.position_base
-        if amount_base <= 0 and not self.config.dry_run:
-            amount_base = self.fetch_base_free_balance()
+        if not self.config.dry_run:
+            free_base = self.fetch_base_free_balance()
+            if free_base <= 0:
+                logging.info("Sell skipped because no free base balance is available. Clearing local position state.")
+                self.state.position_base = Decimal("0")
+                self.state.entry_price = Decimal("0")
+                self.state.clear_protective_order()
+                return
+            if amount_base <= 0:
+                amount_base = free_base
+            else:
+                amount_base = min(amount_base, free_base)
         amount_base = self.quantize_amount(amount_base * self.config.sell_fraction)
 
         if amount_base <= 0:
@@ -137,6 +154,7 @@ class TradingBot:
             return
 
         self.assert_order_submission_allowed()
+        self.cancel_protective_order_if_present()
         order = self.exchange.create_market_sell_order(
             self.config.symbol,
             float(amount_base),
@@ -146,6 +164,71 @@ class TradingBot:
         order_id = str(order.get("id")) if isinstance(order, dict) else None
         self.state.record_trade("sell", amount_base, average_price, quote_notional, mode=self.execution_mode, order_id=order_id)
         logging.info("Sell submitted: %s", order)
+
+    def place_protective_order_after_buy(self, amount_base: Decimal, entry_price: Decimal) -> None:
+        if not self.config.attach_tp_sl:
+            return
+        if amount_base <= 0 or entry_price <= 0:
+            logging.warning("Protective TP/SL skipped because filled amount or entry price is invalid.")
+            return
+        if self.config.dry_run:
+            take_profit_price, stop_loss_price = self.exit_prices(entry_price)
+            logging.info(
+                "[DRY RUN] Would place OKX OCO TP/SL: amount=%s take_profit=%s stop_loss=%s.",
+                amount_base,
+                take_profit_price,
+                stop_loss_price,
+            )
+            return
+
+        payload = self.build_protective_oco_payload(amount_base, entry_price)
+        response = self.exchange.private_post_trade_order_algo(payload)
+        algo_id, algo_cl_ord_id = self.extract_algo_identifiers(response, payload.get("algoClOrdId"))
+        self.state.set_protective_order(algo_id, algo_cl_ord_id)
+        logging.info("Protective OKX OCO TP/SL submitted: %s", response)
+
+    def build_protective_oco_payload(self, amount_base: Decimal, entry_price: Decimal) -> dict[str, str]:
+        take_profit_price, stop_loss_price = self.exit_prices(entry_price)
+        self.exchange.load_markets()
+        market = self.exchange.market(self.config.symbol)
+        inst_id = market["id"]
+        amount = self.exchange.amount_to_precision(self.config.symbol, float(amount_base))
+        take_profit = self.exchange.price_to_precision(self.config.symbol, float(take_profit_price))
+        stop_loss = self.exchange.price_to_precision(self.config.symbol, float(stop_loss_price))
+
+        return {
+            "instId": inst_id,
+            "tdMode": "cash",
+            "side": "sell",
+            "ordType": "oco",
+            "sz": amount,
+            "tpTriggerPx": take_profit,
+            "tpOrdPx": "-1",
+            "tpTriggerPxType": "last",
+            "slTriggerPx": stop_loss,
+            "slOrdPx": "-1",
+            "slTriggerPxType": "last",
+            "algoClOrdId": self.new_algo_client_id(),
+        }
+
+    def cancel_protective_order_if_present(self) -> None:
+        if not self.state.protective_algo_id:
+            return
+
+        self.exchange.load_markets()
+        market = self.exchange.market(self.config.symbol)
+        payload = [{"algoId": self.state.protective_algo_id, "instId": market["id"]}]
+        try:
+            response = self.exchange.private_post_trade_cancel_algos(payload)
+            logging.info("Protective OKX OCO TP/SL canceled before market sell: %s", response)
+            self.state.clear_protective_order()
+        except Exception:
+            logging.exception("Failed to cancel protective OKX OCO TP/SL before market sell.")
+
+    def exit_prices(self, entry_price: Decimal) -> tuple[Decimal, Decimal]:
+        take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct)
+        stop_loss_price = entry_price * (Decimal("1") - self.config.stop_loss_pct)
+        return take_profit_price, stop_loss_price
 
     def create_market_buy(self, quote_amount: Decimal) -> dict[str, Any]:
         if hasattr(self.exchange, "create_market_buy_order_with_cost"):
@@ -201,6 +284,20 @@ class TradingBot:
     @staticmethod
     def quantize_amount(value: Decimal) -> Decimal:
         return value.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+    @staticmethod
+    def extract_algo_identifiers(response: Any, fallback_algo_cl_ord_id: str | None) -> tuple[str | None, str | None]:
+        if isinstance(response, dict):
+            data = response.get("data")
+            if isinstance(data, list) and data:
+                first = data[0]
+                if isinstance(first, dict):
+                    return first.get("algoId") or None, first.get("algoClOrdId") or fallback_algo_cl_ord_id
+        return None, fallback_algo_cl_ord_id
+
+    @staticmethod
+    def new_algo_client_id() -> str:
+        return f"codex{int(time.time() * 1000)}"[:32]
 
     @staticmethod
     def format_confidence(value: Decimal) -> str:

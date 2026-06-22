@@ -80,6 +80,7 @@ class BotConfig:
     max_daily_notional: Decimal
     stop_loss_pct: Decimal
     take_profit_pct: Decimal
+    attach_tp_sl: bool
     sell_fraction: Decimal
     state_file: str
 
@@ -116,6 +117,7 @@ class BotConfig:
             max_daily_notional=env_decimal("MAX_DAILY_NOTIONAL", "50"),
             stop_loss_pct=env_decimal("STOP_LOSS_PCT", "0.02"),
             take_profit_pct=env_decimal("TAKE_PROFIT_PCT", "0.04"),
+            attach_tp_sl=env_bool("ATTACH_TP_SL", True),
             sell_fraction=env_decimal("SELL_FRACTION", "1"),
             state_file=os.getenv("STATE_FILE", "state.json").strip(),
         )

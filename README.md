@@ -193,6 +193,7 @@ MAX_QUOTE_PER_ORDER=10
 MAX_DAILY_NOTIONAL=50
 STOP_LOSS_PCT=0.02
 TAKE_PROFIT_PCT=0.04
+ATTACH_TP_SL=true
 SELL_FRACTION=1
 ```
 
@@ -201,7 +202,27 @@ SELL_FRACTION=1
 - `MAX_DAILY_NOTIONAL`：每日最大累計交易額。
 - `STOP_LOSS_PCT`：停損百分比。
 - `TAKE_PROFIT_PCT`：停利百分比。
+- `ATTACH_TP_SL`：買入成交後，是否在 OKX 掛 OCO 止盈 / 止損 algo 單。
 - `SELL_FRACTION`：賣出比例，`1` 代表全部賣出。
+
+## OKX 原生止盈 / 止損
+
+當 `ATTACH_TP_SL=true` 且 `DRY_RUN=false` 時，bot 買入成交後會立刻在 OKX 掛一張 `ordType=oco` 的賣出 algo 單：
+
+- 止盈觸發價：`entry_price * (1 + TAKE_PROFIT_PCT)`
+- 止損觸發價：`entry_price * (1 - STOP_LOSS_PCT)`
+- 止盈和止損都使用市價執行，也就是 OKX API 的 `tpOrdPx=-1` 和 `slOrdPx=-1`
+
+例如買入價是 `64000`：
+
+```text
+STOP_LOSS_PCT=0.02   -> 止損觸發價 62720
+TAKE_PROFIT_PCT=0.04 -> 止盈觸發價 66560
+```
+
+如果後續策略出現結構賣出訊號，bot 會先取消原本的 OCO 保護單，再送出市價賣出，避免重複賣出。
+
+如果 OKX OCO 掛單失敗，bot 會記錄錯誤，並保留程式內部的停利 / 停損監控作為備援。
 
 ## 參考
 

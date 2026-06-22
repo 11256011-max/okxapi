@@ -18,6 +18,8 @@ class BotState:
     daily_notional: Decimal = Decimal("0")
     position_base: Decimal = Decimal("0")
     entry_price: Decimal = Decimal("0")
+    protective_algo_id: str | None = None
+    protective_algo_cl_ord_id: str | None = None
     trades: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
@@ -32,6 +34,8 @@ class BotState:
             daily_notional=Decimal(str(raw.get("daily_notional", "0"))),
             position_base=Decimal(str(raw.get("position_base", "0"))),
             entry_price=Decimal(str(raw.get("entry_price", "0"))),
+            protective_algo_id=raw.get("protective_algo_id") or None,
+            protective_algo_cl_ord_id=raw.get("protective_algo_cl_ord_id") or None,
             trades=raw.get("trades", []),
         )
         state.reset_daily_if_needed()
@@ -46,6 +50,8 @@ class BotState:
                     "daily_notional": str(self.daily_notional),
                     "position_base": str(self.position_base),
                     "entry_price": str(self.entry_price),
+                    "protective_algo_id": self.protective_algo_id,
+                    "protective_algo_cl_ord_id": self.protective_algo_cl_ord_id,
                     "trades": self.trades[-100:],
                 },
                 ensure_ascii=False,
@@ -94,4 +100,12 @@ class BotState:
             self.position_base = max(Decimal("0"), self.position_base - amount_base)
             if self.position_base == 0:
                 self.entry_price = Decimal("0")
+                self.clear_protective_order()
 
+    def set_protective_order(self, algo_id: str | None, algo_cl_ord_id: str | None) -> None:
+        self.protective_algo_id = algo_id
+        self.protective_algo_cl_ord_id = algo_cl_ord_id
+
+    def clear_protective_order(self) -> None:
+        self.protective_algo_id = None
+        self.protective_algo_cl_ord_id = None

@@ -30,7 +30,7 @@ class StrategyTests(unittest.TestCase):
             "SMC_MIN_DISPLACEMENT_PCT": "0.001",
             "SMC_REQUIRE_FVG": "false",
         }
-        with patch.dict(os.environ, env, clear=True):
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
             return BotConfig.from_env()
 
     def test_create_strategy_selects_smc(self) -> None:

@@ -15,26 +15,26 @@ class ConfigTests(unittest.TestCase):
             "OKX_SECRET_KEY": "secret",
             "OKX_PASSPHRASE": "passphrase",
         }
-        with patch.dict(os.environ, env, clear=True):
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
             config = BotConfig.from_env()
             with self.assertRaises(ConfigError):
                 config.validate()
 
     def test_default_config_is_dry_run(self) -> None:
-        with patch.dict(os.environ, {}, clear=True):
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {}, clear=True):
             config = BotConfig.from_env()
             config.validate()
             self.assertTrue(config.dry_run)
             self.assertTrue(config.okx_simulated_trading)
 
     def test_unknown_strategy_is_rejected(self) -> None:
-        with patch.dict(os.environ, {"STRATEGY": "unknown"}, clear=True):
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"STRATEGY": "unknown"}, clear=True):
             config = BotConfig.from_env()
             with self.assertRaises(ConfigError):
                 config.validate()
 
     def test_signal_confidence_threshold_accepts_percent(self) -> None:
-        with patch.dict(os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "90"}, clear=True):
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "90"}, clear=True):
             config = BotConfig.from_env()
             config.validate()
             self.assertEqual(str(config.signal_confidence_threshold), "0.9")
