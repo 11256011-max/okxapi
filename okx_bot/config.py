@@ -105,7 +105,7 @@ class BotConfig:
             market_type=os.getenv("MARKET_TYPE", "spot").strip().lower(),
             leverage=env_decimal("LEVERAGE", "1"),
             strategy=os.getenv("STRATEGY", "ema_rsi").strip().lower(),
-            signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.90"),
+            signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"),
             fast_ema=env_int("FAST_EMA", 9),
             slow_ema=env_int("SLOW_EMA", 21),
             rsi_period=env_int("RSI_PERIOD", 14),

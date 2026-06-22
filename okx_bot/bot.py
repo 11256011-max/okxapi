@@ -24,6 +24,7 @@ class TradingBot:
     def run_once(self) -> None:
         self.state.reset_daily_if_needed()
         for symbol in self.config.symbols:
+            self.ensure_protective_order_for_position(symbol)
             try:
                 candles = self.fetch_candles(symbol)
             except Exception as exc:
@@ -146,26 +147,33 @@ class TradingBot:
         except Exception as exc:
             logging.warning("Buy failed due to order execution error: %s", exc)
             return
-        filled_base = self.decimal_from_order(order, "filled", amount_base)
-        average_price = self.decimal_from_order(order, "average", signal.price)
         order_id = str(order.get("id")) if isinstance(order, dict) else None
+        filled_base, average_price = self.resolve_buy_fill(
+            order=order,
+            symbol=symbol,
+            quote_amount=quote_amount,
+            base_balance_before=base_balance_before,
+            fallback_price=signal.price,
+        )
+
+        if filled_base <= 0 or average_price <= 0:
+            logging.warning(
+                "Buy order was submitted but no filled base balance could be confirmed yet; "
+                "skipping local position record and protective TP/SL for now. order_id=%s",
+                order_id,
+            )
+            return
+
         self.state.record_trade(
             "buy",
-            filled_base or amount_base,
-            average_price or signal.price,
+            filled_base,
+            average_price,
             quote_amount,
             mode=self.execution_mode,
             order_id=order_id,
             symbol=symbol,
         )
         logging.info("Buy submitted: %s", order)
-
-        if filled_base <= 0 or average_price <= 0:
-            logging.warning(
-                "Buy order returned incomplete fill details; skipping protective TP/SL."
-                " Confirm actual execution via fetch_order or fetch_balance."
-            )
-            return
 
         try:
             self.place_protective_order_after_buy(filled_base, average_price, symbol)
@@ -237,11 +245,83 @@ class TradingBot:
             )
             return
 
-        payload = self.build_protective_oco_payload(amount_base, entry_price, symbol)
+        available_base = self.wait_for_available_base(symbol, amount_base)
+        if available_base <= 0:
+            logging.warning("Protective TP/SL skipped because no available %s balance was confirmed.", symbol)
+            return
+
+        protect_amount = self.quantize_amount(min(amount_base, available_base))
+        if protect_amount <= 0:
+            logging.warning("Protective TP/SL skipped because available %s amount is too small.", symbol)
+            return
+
+        payload = self.build_protective_oco_payload(protect_amount, entry_price, symbol)
         response = self.exchange.private_post_trade_order_algo(payload)
         algo_id, algo_cl_ord_id = self.extract_algo_identifiers(response, payload.get("algoClOrdId"))
         self.state.set_protective_order(symbol, algo_id, algo_cl_ord_id)
         logging.info("Protective OKX OCO TP/SL submitted: %s", response)
+
+    def ensure_protective_order_for_position(self, symbol: str) -> None:
+        if self.config.dry_run or not self.config.attach_tp_sl:
+            return
+        if self.state.get_protective_algo_id(symbol):
+            return
+
+        position_base = self.state.get_position_base(symbol)
+        entry_price = self.state.get_entry_price(symbol)
+        if position_base <= 0 or entry_price <= 0:
+            return
+
+        try:
+            self.place_protective_order_after_buy(position_base, entry_price, symbol)
+            logging.info("Protective OKX OCO TP/SL restored for existing %s position.", symbol)
+        except Exception:
+            logging.exception("Failed to restore protective OKX OCO TP/SL for existing %s position.", symbol)
+
+    def resolve_buy_fill(
+        self,
+        order: dict[str, Any],
+        symbol: str,
+        quote_amount: Decimal,
+        base_balance_before: Decimal,
+        fallback_price: Decimal,
+    ) -> tuple[Decimal, Decimal]:
+        order_id = str(order.get("id")) if isinstance(order, dict) and order.get("id") else None
+        for attempt in range(8):
+            fetched_order = self.fetch_order_safely(order_id, symbol)
+            filled_base = self.decimal_from_order(fetched_order, "filled", Decimal("0"))
+            average_price = self.decimal_from_order(fetched_order, "average", Decimal("0"))
+            if filled_base > 0 and average_price > 0:
+                return self.quantize_amount(filled_base), average_price
+
+            base_balance_after = self.fetch_base_free_balance(symbol)
+            balance_delta = base_balance_after - base_balance_before
+            if balance_delta > 0:
+                average_from_cost = quote_amount / balance_delta
+                return self.quantize_amount(balance_delta), average_price or average_from_cost or fallback_price
+
+            if attempt < 7:
+                time.sleep(0.5)
+
+        return Decimal("0"), Decimal("0")
+
+    def fetch_order_safely(self, order_id: str | None, symbol: str) -> dict[str, Any]:
+        if not order_id:
+            return {}
+        try:
+            order = self.exchange.fetch_order(order_id, symbol)
+            return order if isinstance(order, dict) else {}
+        except Exception:
+            return {}
+
+    def wait_for_available_base(self, symbol: str, desired_amount: Decimal) -> Decimal:
+        for attempt in range(8):
+            available_base = self.fetch_base_free_balance(symbol)
+            if available_base >= desired_amount or (available_base > 0 and attempt >= 2):
+                return available_base
+            if attempt < 7:
+                time.sleep(0.5)
+        return self.fetch_base_free_balance(symbol)
 
     def build_protective_oco_payload(self, amount_base: Decimal, entry_price: Decimal, symbol: str) -> dict[str, str]:
         take_profit_price, stop_loss_price = self.exit_prices(entry_price)

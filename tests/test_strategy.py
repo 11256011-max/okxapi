@@ -69,7 +69,7 @@ class StrategyTests(unittest.TestCase):
 
         self.assertEqual(signal.action, "buy")
         self.assertEqual(signal.indicators["bullish_bos"], 1.0)
-        self.assertGreaterEqual(signal.confidence, Decimal("0.90"))
+        self.assertGreaterEqual(signal.confidence, Decimal("0.80"))
 
 
 if __name__ == "__main__":

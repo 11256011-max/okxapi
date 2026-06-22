@@ -34,10 +34,10 @@ class ConfigTests(unittest.TestCase):
                 config.validate()
 
     def test_signal_confidence_threshold_accepts_percent(self) -> None:
-        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "90"}, clear=True):
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "80"}, clear=True):
             config = BotConfig.from_env()
             config.validate()
-            self.assertEqual(str(config.signal_confidence_threshold), "0.9")
+            self.assertEqual(str(config.signal_confidence_threshold), "0.8")
 
 
 if __name__ == "__main__":

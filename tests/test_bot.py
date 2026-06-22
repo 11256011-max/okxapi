@@ -33,7 +33,7 @@ class FakeExchange:
 class BotSignalGateTests(unittest.TestCase):
     def test_low_confidence_trade_signal_is_blocked(self) -> None:
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(
-            os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "0.90"}, clear=True
+            os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "0.80"}, clear=True
         ):
             config = BotConfig.from_env()
         bot_like = object.__new__(TradingBot)
@@ -53,7 +53,7 @@ class BotSignalGateTests(unittest.TestCase):
 
     def test_high_confidence_trade_signal_is_allowed(self) -> None:
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(
-            os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "0.90"}, clear=True
+            os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "0.80"}, clear=True
         ):
             config = BotConfig.from_env()
         bot_like = object.__new__(TradingBot)
@@ -62,8 +62,8 @@ class BotSignalGateTests(unittest.TestCase):
             "buy",
             "Test buy signal.",
             Decimal("100"),
-            {"confidence": 0.95},
-            Decimal("0.95"),
+            {"confidence": 0.80},
+            Decimal("0.80"),
         )
 
         gated = TradingBot.apply_signal_confidence_gate(bot_like, signal)
