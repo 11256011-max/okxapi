@@ -57,7 +57,7 @@ class BotConfig:
     okx_simulated_trading: bool
     dry_run: bool
     enable_live_trading: bool
-    symbol: str
+    symbols: list[str]
     timeframe: str
     candle_limit: int
     poll_seconds: int
@@ -87,6 +87,10 @@ class BotConfig:
     @classmethod
     def from_env(cls) -> "BotConfig":
         load_dotenv_if_available()
+        symbols_raw = os.getenv("SYMBOLS", "")
+        if not symbols_raw:
+            symbols_raw = os.getenv("SYMBOL", "BTC/USDT")
+        symbols = [s.strip().upper() for s in symbols_raw.split(",") if s.strip()]
         return cls(
             api_key=os.getenv("OKX_API_KEY", "").strip(),
             secret_key=os.getenv("OKX_SECRET_KEY", "").strip(),
@@ -94,7 +98,7 @@ class BotConfig:
             okx_simulated_trading=env_bool("OKX_SIMULATED_TRADING", True),
             dry_run=env_bool("DRY_RUN", True),
             enable_live_trading=env_bool("ENABLE_LIVE_TRADING", False),
-            symbol=os.getenv("SYMBOL", "BTC/USDT").strip(),
+            symbols=symbols,
             timeframe=os.getenv("TIMEFRAME", "1m").strip(),
             candle_limit=env_int("CANDLE_LIMIT", 200),
             poll_seconds=env_int("POLL_SECONDS", 60),
@@ -152,6 +156,12 @@ class BotConfig:
             minimum_smc_candles = (self.smc_swing_lookback * 2) + self.smc_zone_lookback + 5
             if self.candle_limit < minimum_smc_candles:
                 raise ConfigError(f"CANDLE_LIMIT must be at least {minimum_smc_candles} for SMC.")
+        if not self.symbols:
+            raise ConfigError("SYMBOLS is required and must include at least one market symbol like BTC/USDT.")
+        if any("/" not in symbol for symbol in self.symbols):
+            raise ConfigError("SYMBOLS must be a comma-separated list of market symbols like BTC/USDT.")
+        if any(symbol.split("/")[1] != "USDT" for symbol in self.symbols):
+            raise ConfigError("All SYMBOLS must use USDT as the quote currency.")
         if self.order_quote_amount <= 0:
             raise ConfigError("ORDER_QUOTE_AMOUNT must be greater than 0.")
         if self.max_quote_per_order <= 0 or self.max_daily_notional <= 0:

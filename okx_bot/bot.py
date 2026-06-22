@@ -19,30 +19,38 @@ class TradingBot:
         self.exchange = create_exchange(config)
         self.strategy = create_strategy(config)
         self.risk = RiskManager(config)
-        self.state = BotState.load(config.state_file)
+        self.state = BotState.load(config.state_file, default_symbol=self.config.symbols[0])
 
     def run_once(self) -> None:
         self.state.reset_daily_if_needed()
-        candles = self.fetch_candles()
-        signal = self.strategy.generate(candles)
-        signal = self.apply_signal_confidence_gate(signal)
-        signal = self.apply_position_risk(signal)
+        for symbol in self.config.symbols:
+            try:
+                candles = self.fetch_candles(symbol)
+            except Exception as exc:
+                logging.warning("Skipping %s because candle fetch failed: %s", symbol, exc)
+                continue
 
-        logging.info(
-            "Signal=%s confidence=%s price=%s reason=%s indicators=%s",
-            signal.action,
-            self.format_confidence(signal.confidence),
-            signal.price,
-            signal.reason,
-            signal.indicators,
-        )
+            signal = self.strategy.generate(candles)
+            signal = self.apply_signal_confidence_gate(signal)
+            signal = self.apply_position_risk(symbol, signal)
 
-        self.execute_signal(signal)
+            logging.info(
+                "Symbol=%s Signal=%s confidence=%s price=%s reason=%s indicators=%s",
+                symbol,
+                signal.action,
+                self.format_confidence(signal.confidence),
+                signal.price,
+                signal.reason,
+                signal.indicators,
+            )
+
+            self.execute_signal(symbol, signal)
+
         self.state.save(self.config.state_file)
 
-    def fetch_candles(self) -> list[Candle]:
+    def fetch_candles(self, symbol: str) -> list[Candle]:
         raw_candles = self.exchange.fetch_ohlcv(
-            self.config.symbol,
+            symbol,
             timeframe=self.config.timeframe,
             limit=self.config.candle_limit,
         )
@@ -61,12 +69,12 @@ class TradingBot:
             raise RuntimeError("No candles returned by exchange.")
         return candles
 
-    def apply_position_risk(self, signal: Signal) -> Signal:
-        if self.config.attach_tp_sl and self.state.protective_algo_id and not self.config.dry_run:
+    def apply_position_risk(self, symbol: str, signal: Signal) -> Signal:
+        if self.config.attach_tp_sl and self.state.get_protective_algo_id(symbol) and not self.config.dry_run:
             return signal
-        if self.risk.stop_loss_hit(self.state, signal.price):
+        if self.risk.stop_loss_hit(self.state, symbol, signal.price):
             return Signal("sell", "Stop loss hit.", signal.price, signal.indicators, Decimal("1"))
-        if self.risk.take_profit_hit(self.state, signal.price):
+        if self.risk.take_profit_hit(self.state, symbol, signal.price):
             return Signal("sell", "Take profit hit.", signal.price, signal.indicators, Decimal("1"))
         return signal
 
@@ -84,21 +92,21 @@ class TradingBot:
         )
         return Signal("hold", reason, signal.price, indicators, signal.confidence)
 
-    def execute_signal(self, signal: Signal) -> None:
+    def execute_signal(self, symbol: str, signal: Signal) -> None:
         if signal.action == "hold":
             return
         if signal.action == "buy":
-            self.buy(signal)
+            self.buy(symbol, signal)
             return
         if signal.action == "sell":
-            self.sell(signal)
+            self.sell(symbol, signal)
             return
         raise RuntimeError(f"Unknown signal action: {signal.action}")
 
-    def buy(self, signal: Signal) -> None:
-        if self.state.position_base > 0:
-            logging.info("Buy skipped because state already has an open spot position.")
-            return
+    def buy(self, symbol: str, signal: Signal) -> None:
+        current_position = self.state.get_position_base(symbol)
+        if current_position > 0:
+            logging.info("Adding to existing position for %s: current base=%s", symbol, current_position)
 
         try:
             decision = self.risk.approve_buy(self.state)
@@ -110,31 +118,70 @@ class TradingBot:
         amount_base = self.quantize_amount(quote_amount / signal.price)
 
         if self.config.dry_run:
-            logging.info("[DRY RUN] Would buy about %s %s for %s quote.", amount_base, self.config.symbol, quote_amount)
-            self.state.record_trade("buy", amount_base, signal.price, quote_amount, mode="dry-run")
+            logging.info("[DRY RUN] Would buy about %s %s for %s quote.", amount_base, symbol, quote_amount)
+            self.state.record_trade("buy", amount_base, signal.price, quote_amount, mode="dry-run", symbol=symbol)
             return
 
         self.assert_order_submission_allowed()
-        order = self.create_market_buy(quote_amount)
+        free_quote = self.fetch_quote_free_balance(symbol)
+        if free_quote <= 0:
+            logging.warning("Buy skipped because no available quote balance is available.")
+            return
+        if quote_amount > free_quote:
+            logging.warning(
+                "Requested buy quote amount %s exceeds available quote balance %s; reducing order size.",
+                quote_amount,
+                free_quote,
+            )
+            quote_amount = free_quote
+            amount_base = self.quantize_amount(quote_amount / signal.price)
+            if amount_base <= 0:
+                logging.warning("Buy skipped because reduced order size is too small.")
+                return
+
+        base_balance_before = self.fetch_base_free_balance(symbol)
+
+        try:
+            order = self.create_market_buy(quote_amount, symbol)
+        except Exception as exc:
+            logging.warning("Buy failed due to order execution error: %s", exc)
+            return
         filled_base = self.decimal_from_order(order, "filled", amount_base)
         average_price = self.decimal_from_order(order, "average", signal.price)
         order_id = str(order.get("id")) if isinstance(order, dict) else None
-        self.state.record_trade("buy", filled_base, average_price, quote_amount, mode=self.execution_mode, order_id=order_id)
+        self.state.record_trade(
+            "buy",
+            filled_base or amount_base,
+            average_price or signal.price,
+            quote_amount,
+            mode=self.execution_mode,
+            order_id=order_id,
+            symbol=symbol,
+        )
         logging.info("Buy submitted: %s", order)
+
+        if filled_base <= 0 or average_price <= 0:
+            logging.warning(
+                "Buy order returned incomplete fill details; skipping protective TP/SL."
+                " Confirm actual execution via fetch_order or fetch_balance."
+            )
+            return
+
         try:
-            self.place_protective_order_after_buy(filled_base, average_price)
+            self.place_protective_order_after_buy(filled_base, average_price, symbol)
         except Exception:
             logging.exception("Failed to place protective OKX OCO TP/SL. Internal TP/SL monitor remains active.")
 
-    def sell(self, signal: Signal) -> None:
-        amount_base = self.state.position_base
+    def sell(self, symbol: str, signal: Signal) -> None:
+        amount_base = self.state.get_position_base(symbol)
         if not self.config.dry_run:
-            free_base = self.fetch_base_free_balance()
+            free_base = self.fetch_base_free_balance(symbol)
             if free_base <= 0:
-                logging.info("Sell skipped because no free base balance is available. Clearing local position state.")
-                self.state.position_base = Decimal("0")
-                self.state.entry_price = Decimal("0")
-                self.state.clear_protective_order()
+                logging.info(
+                    "Sell skipped for %s because no free base balance is available. Clearing local position state.",
+                    symbol,
+                )
+                self.state.clear_symbol_position(symbol)
                 return
             if amount_base <= 0:
                 amount_base = free_base
@@ -149,23 +196,31 @@ class TradingBot:
         quote_notional = amount_base * signal.price
 
         if self.config.dry_run:
-            logging.info("[DRY RUN] Would sell %s %s.", amount_base, self.config.symbol)
-            self.state.record_trade("sell", amount_base, signal.price, quote_notional, mode="dry-run")
+            logging.info("[DRY RUN] Would sell %s %s.", amount_base, symbol)
+            self.state.record_trade("sell", amount_base, signal.price, quote_notional, mode="dry-run", symbol=symbol)
             return
 
         self.assert_order_submission_allowed()
-        self.cancel_protective_order_if_present()
+        self.cancel_protective_order_if_present(symbol)
         order = self.exchange.create_market_sell_order(
-            self.config.symbol,
+            symbol,
             float(amount_base),
             params={"tdMode": "cash"},
         )
         average_price = self.decimal_from_order(order, "average", signal.price)
         order_id = str(order.get("id")) if isinstance(order, dict) else None
-        self.state.record_trade("sell", amount_base, average_price, quote_notional, mode=self.execution_mode, order_id=order_id)
+        self.state.record_trade(
+            "sell",
+            amount_base,
+            average_price,
+            quote_notional,
+            mode=self.execution_mode,
+            order_id=order_id,
+            symbol=symbol,
+        )
         logging.info("Sell submitted: %s", order)
 
-    def place_protective_order_after_buy(self, amount_base: Decimal, entry_price: Decimal) -> None:
+    def place_protective_order_after_buy(self, amount_base: Decimal, entry_price: Decimal, symbol: str) -> None:
         if not self.config.attach_tp_sl:
             return
         if amount_base <= 0 or entry_price <= 0:
@@ -174,27 +229,28 @@ class TradingBot:
         if self.config.dry_run:
             take_profit_price, stop_loss_price = self.exit_prices(entry_price)
             logging.info(
-                "[DRY RUN] Would place OKX OCO TP/SL: amount=%s take_profit=%s stop_loss=%s.",
+                "[DRY RUN] Would place OKX OCO TP/SL for %s: amount=%s take_profit=%s stop_loss=%s.",
+                symbol,
                 amount_base,
                 take_profit_price,
                 stop_loss_price,
             )
             return
 
-        payload = self.build_protective_oco_payload(amount_base, entry_price)
+        payload = self.build_protective_oco_payload(amount_base, entry_price, symbol)
         response = self.exchange.private_post_trade_order_algo(payload)
         algo_id, algo_cl_ord_id = self.extract_algo_identifiers(response, payload.get("algoClOrdId"))
-        self.state.set_protective_order(algo_id, algo_cl_ord_id)
+        self.state.set_protective_order(symbol, algo_id, algo_cl_ord_id)
         logging.info("Protective OKX OCO TP/SL submitted: %s", response)
 
-    def build_protective_oco_payload(self, amount_base: Decimal, entry_price: Decimal) -> dict[str, str]:
+    def build_protective_oco_payload(self, amount_base: Decimal, entry_price: Decimal, symbol: str) -> dict[str, str]:
         take_profit_price, stop_loss_price = self.exit_prices(entry_price)
         self.exchange.load_markets()
-        market = self.exchange.market(self.config.symbol)
+        market = self.exchange.market(symbol)
         inst_id = market["id"]
-        amount = self.exchange.amount_to_precision(self.config.symbol, float(amount_base))
-        take_profit = self.exchange.price_to_precision(self.config.symbol, float(take_profit_price))
-        stop_loss = self.exchange.price_to_precision(self.config.symbol, float(stop_loss_price))
+        amount = self.exchange.amount_to_precision(symbol, float(amount_base))
+        take_profit = self.exchange.price_to_precision(symbol, float(take_profit_price))
+        stop_loss = self.exchange.price_to_precision(symbol, float(stop_loss_price))
 
         return {
             "instId": inst_id,
@@ -211,17 +267,18 @@ class TradingBot:
             "algoClOrdId": self.new_algo_client_id(),
         }
 
-    def cancel_protective_order_if_present(self) -> None:
-        if not self.state.protective_algo_id:
+    def cancel_protective_order_if_present(self, symbol: str) -> None:
+        algo_id = self.state.get_protective_algo_id(symbol)
+        if not algo_id:
             return
 
         self.exchange.load_markets()
-        market = self.exchange.market(self.config.symbol)
-        payload = [{"algoId": self.state.protective_algo_id, "instId": market["id"]}]
+        market = self.exchange.market(symbol)
+        payload = [{"algoId": algo_id, "instId": market["id"]}]
         try:
             response = self.exchange.private_post_trade_cancel_algos(payload)
             logging.info("Protective OKX OCO TP/SL canceled before market sell: %s", response)
-            self.state.clear_protective_order()
+            self.state.clear_protective_order(symbol)
         except Exception:
             logging.exception("Failed to cancel protective OKX OCO TP/SL before market sell.")
 
@@ -230,18 +287,18 @@ class TradingBot:
         stop_loss_price = entry_price * (Decimal("1") - self.config.stop_loss_pct)
         return take_profit_price, stop_loss_price
 
-    def create_market_buy(self, quote_amount: Decimal) -> dict[str, Any]:
+    def create_market_buy(self, quote_amount: Decimal, symbol: str) -> dict[str, Any]:
         if hasattr(self.exchange, "create_market_buy_order_with_cost"):
             return self.exchange.create_market_buy_order_with_cost(
-                self.config.symbol,
+                symbol,
                 float(quote_amount),
                 params={"tdMode": "cash"},
             )
-        ticker = self.exchange.fetch_ticker(self.config.symbol)
+        ticker = self.exchange.fetch_ticker(symbol)
         last_price = Decimal(str(ticker["last"]))
         amount_base = self.quantize_amount(quote_amount / last_price)
         return self.exchange.create_market_buy_order(
-            self.config.symbol,
+            symbol,
             float(amount_base),
             params={"tdMode": "cash"},
         )
@@ -255,8 +312,14 @@ class TradingBot:
             if total_amount:
                 logging.info("%s total=%s free=%s", currency, total_amount, free.get(currency))
 
-    def fetch_base_free_balance(self) -> Decimal:
-        base_currency = self.config.symbol.split("/")[0]
+    def fetch_quote_free_balance(self, symbol: str) -> Decimal:
+        quote_currency = symbol.split("/")[1]
+        balance = self.exchange.fetch_balance()
+        free = balance.get("free", {})
+        return Decimal(str(free.get(quote_currency, "0") or "0"))
+
+    def fetch_base_free_balance(self, symbol: str) -> Decimal:
+        base_currency = symbol.split("/")[0]
         balance = self.exchange.fetch_balance()
         free = balance.get("free", {})
         return Decimal(str(free.get(base_currency, "0") or "0"))

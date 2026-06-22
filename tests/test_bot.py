@@ -84,7 +84,7 @@ class BotProtectiveOrderTests(unittest.TestCase):
     def test_build_protective_oco_payload(self) -> None:
         bot = self.make_bot()
 
-        payload = bot.build_protective_oco_payload(Decimal("0.01"), Decimal("100"))
+        payload = bot.build_protective_oco_payload(Decimal("0.01"), Decimal("100"), "BTC/USDT")
 
         self.assertEqual(payload["instId"], "BTC-USDT")
         self.assertEqual(payload["tdMode"], "cash")
@@ -100,12 +100,12 @@ class BotProtectiveOrderTests(unittest.TestCase):
 
     def test_cancel_protective_order_uses_algo_id(self) -> None:
         bot = self.make_bot()
-        bot.state.set_protective_order("12345", "client123")
+        bot.state.set_protective_order("BTC/USDT", "12345", "client123")
 
-        bot.cancel_protective_order_if_present()
+        bot.cancel_protective_order_if_present("BTC/USDT")
 
         self.assertEqual(bot.exchange.cancel_payload, [{"algoId": "12345", "instId": "BTC-USDT"}])
-        self.assertIsNone(bot.state.protective_algo_id)
+        self.assertIsNone(bot.state.get_protective_algo_id("BTC/USDT"))
 
 
 if __name__ == "__main__":

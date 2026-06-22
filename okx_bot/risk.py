@@ -29,15 +29,18 @@ class RiskManager:
             )
         return RiskDecision(quote_amount=quote_amount)
 
-    def stop_loss_hit(self, state: BotState, current_price: Decimal) -> bool:
-        if state.position_base <= 0 or state.entry_price <= 0:
+    def stop_loss_hit(self, state: BotState, symbol: str, current_price: Decimal) -> bool:
+        position_base = state.get_position_base(symbol)
+        entry_price = state.get_entry_price(symbol)
+        if position_base <= 0 or entry_price <= 0:
             return False
-        stop_price = state.entry_price * (Decimal("1") - self.config.stop_loss_pct)
+        stop_price = entry_price * (Decimal("1") - self.config.stop_loss_pct)
         return current_price <= stop_price
 
-    def take_profit_hit(self, state: BotState, current_price: Decimal) -> bool:
-        if state.position_base <= 0 or state.entry_price <= 0:
+    def take_profit_hit(self, state: BotState, symbol: str, current_price: Decimal) -> bool:
+        position_base = state.get_position_base(symbol)
+        entry_price = state.get_entry_price(symbol)
+        if position_base <= 0 or entry_price <= 0:
             return False
-        target_price = state.entry_price * (Decimal("1") + self.config.take_profit_pct)
+        target_price = entry_price * (Decimal("1") + self.config.take_profit_pct)
         return current_price >= target_price
-
