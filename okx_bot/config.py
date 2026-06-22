@@ -42,6 +42,13 @@ def env_decimal(name: str, default: str) -> Decimal:
         raise ConfigError(f"{name} must be a decimal number") from exc
 
 
+def env_probability(name: str, default: str) -> Decimal:
+    value = env_decimal(name, default)
+    if value > Decimal("1") and value <= Decimal("100"):
+        return value / Decimal("100")
+    return value
+
+
 @dataclass(frozen=True)
 class BotConfig:
     api_key: str
@@ -57,6 +64,7 @@ class BotConfig:
     market_type: str
     leverage: Decimal
     strategy: str
+    signal_confidence_threshold: Decimal
     fast_ema: int
     slow_ema: int
     rsi_period: int
@@ -92,6 +100,7 @@ class BotConfig:
             market_type=os.getenv("MARKET_TYPE", "spot").strip().lower(),
             leverage=env_decimal("LEVERAGE", "1"),
             strategy=os.getenv("STRATEGY", "ema_rsi").strip().lower(),
+            signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.90"),
             fast_ema=env_int("FAST_EMA", 9),
             slow_ema=env_int("SLOW_EMA", 21),
             rsi_period=env_int("RSI_PERIOD", 14),
@@ -122,6 +131,8 @@ class BotConfig:
             raise ConfigError("This starter bot does not use leverage. Keep LEVERAGE=1.")
         if self.strategy not in {"ema_rsi", "smc"}:
             raise ConfigError("STRATEGY must be one of: ema_rsi, smc.")
+        if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
+            raise ConfigError("SIGNAL_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
         if self.strategy == "ema_rsi":
             if self.fast_ema <= 1 or self.slow_ema <= 1:
                 raise ConfigError("FAST_EMA and SLOW_EMA must be greater than 1.")

@@ -97,6 +97,28 @@ STRATEGY=ema_rsi
 STRATEGY=smc
 ```
 
+## 訊號符合度門檻
+
+每個策略都會計算 `confidence`，代表目前條件符合策略的程度。只有達到門檻的 `buy` 或 `sell` 訊號才會進入下單流程；低於門檻會自動改成 `hold`。
+
+```env
+SIGNAL_CONFIDENCE_THRESHOLD=0.90
+```
+
+你也可以寫成百分比：
+
+```env
+SIGNAL_CONFIDENCE_THRESHOLD=90
+```
+
+預設 90% 是比較保守的設定。log 會顯示類似：
+
+```text
+Signal=hold confidence=74.00% reason=BUY signal blocked because confidence 74.00% is below threshold 90.00%.
+```
+
+停損和停利是風控退出，不會被這個門檻擋住。
+
 ## EMA + RSI 策略
 
 買入：

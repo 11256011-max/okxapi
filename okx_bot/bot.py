@@ -24,11 +24,13 @@ class TradingBot:
         self.state.reset_daily_if_needed()
         candles = self.fetch_candles()
         signal = self.strategy.generate(candles)
+        signal = self.apply_signal_confidence_gate(signal)
         signal = self.apply_position_risk(signal)
 
         logging.info(
-            "Signal=%s price=%s reason=%s indicators=%s",
+            "Signal=%s confidence=%s price=%s reason=%s indicators=%s",
             signal.action,
+            self.format_confidence(signal.confidence),
             signal.price,
             signal.reason,
             signal.indicators,
@@ -60,10 +62,24 @@ class TradingBot:
 
     def apply_position_risk(self, signal: Signal) -> Signal:
         if self.risk.stop_loss_hit(self.state, signal.price):
-            return Signal("sell", "Stop loss hit.", signal.price, signal.indicators)
+            return Signal("sell", "Stop loss hit.", signal.price, signal.indicators, Decimal("1"))
         if self.risk.take_profit_hit(self.state, signal.price):
-            return Signal("sell", "Take profit hit.", signal.price, signal.indicators)
+            return Signal("sell", "Take profit hit.", signal.price, signal.indicators, Decimal("1"))
         return signal
+
+    def apply_signal_confidence_gate(self, signal: Signal) -> Signal:
+        if signal.action not in {"buy", "sell"}:
+            return signal
+        if signal.confidence >= self.config.signal_confidence_threshold:
+            return signal
+
+        indicators = {**signal.indicators, "confidence": float(signal.confidence)}
+        reason = (
+            f"{signal.action.upper()} signal blocked because confidence "
+            f"{self.format_confidence(signal.confidence)} is below threshold "
+            f"{self.format_confidence(self.config.signal_confidence_threshold)}. {signal.reason}"
+        )
+        return Signal("hold", reason, signal.price, indicators, signal.confidence)
 
     def execute_signal(self, signal: Signal) -> None:
         if signal.action == "hold":
@@ -185,3 +201,7 @@ class TradingBot:
     @staticmethod
     def quantize_amount(value: Decimal) -> Decimal:
         return value.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
+
+    @staticmethod
+    def format_confidence(value: Decimal) -> str:
+        return f"{(value * Decimal('100')).quantize(Decimal('0.01'))}%"

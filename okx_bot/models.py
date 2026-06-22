@@ -20,4 +20,4 @@ class Signal:
     reason: str
     price: Decimal
     indicators: dict[str, float] = field(default_factory=dict)
-
+    confidence: Decimal = Decimal("0")

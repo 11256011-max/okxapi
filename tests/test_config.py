@@ -33,6 +33,12 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 config.validate()
 
+    def test_signal_confidence_threshold_accepts_percent(self) -> None:
+        with patch.dict(os.environ, {"SIGNAL_CONFIDENCE_THRESHOLD": "90"}, clear=True):
+            config = BotConfig.from_env()
+            config.validate()
+            self.assertEqual(str(config.signal_confidence_threshold), "0.9")
+
 
 if __name__ == "__main__":
     unittest.main()

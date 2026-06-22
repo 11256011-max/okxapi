@@ -60,15 +60,67 @@ class EmaRsiStrategy:
         crossed_down = previous_fast >= previous_slow and current_fast < current_slow
 
         if crossed_up and Decimal(str(current_rsi)) <= self.config.rsi_buy_max:
-            return Signal("buy", "Fast EMA crossed above slow EMA and RSI is acceptable.", current_price, indicators)
+            confidence = self.buy_confidence(current_price, current_fast, current_slow, Decimal(str(current_rsi)))
+            return Signal(
+                "buy",
+                "Fast EMA crossed above slow EMA and RSI is acceptable.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         if crossed_down:
-            return Signal("sell", "Fast EMA crossed below slow EMA.", current_price, indicators)
+            confidence = self.sell_confidence(current_price, current_fast, current_slow, Decimal(str(current_rsi)), crossed_down=True)
+            return Signal(
+                "sell",
+                "Fast EMA crossed below slow EMA.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         if Decimal(str(current_rsi)) >= self.config.rsi_sell_min:
-            return Signal("sell", "RSI reached the configured sell threshold.", current_price, indicators)
+            confidence = self.sell_confidence(current_price, current_fast, current_slow, Decimal(str(current_rsi)), crossed_down=False)
+            return Signal(
+                "sell",
+                "RSI reached the configured sell threshold.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         return Signal("hold", "No entry or exit signal.", current_price, indicators)
+
+    def buy_confidence(self, price: Decimal, fast_ema: float, slow_ema: float, current_rsi: Decimal) -> Decimal:
+        spread_score = self.spread_score(price, fast_ema, slow_ema)
+        rsi_room = max(Decimal("0"), self.config.rsi_buy_max - current_rsi)
+        rsi_score = min(Decimal("1"), rsi_room / Decimal("20"))
+        return self.clamp_confidence(Decimal("0.55") + (spread_score * Decimal("0.25")) + (rsi_score * Decimal("0.20")))
+
+    def sell_confidence(
+        self,
+        price: Decimal,
+        fast_ema: float,
+        slow_ema: float,
+        current_rsi: Decimal,
+        crossed_down: bool,
+    ) -> Decimal:
+        spread_score = self.spread_score(price, fast_ema, slow_ema)
+        rsi_excess = max(Decimal("0"), current_rsi - self.config.rsi_sell_min)
+        rsi_score = min(Decimal("1"), rsi_excess / Decimal("15"))
+        cross_score = Decimal("0.60") if crossed_down else Decimal("0.25")
+        return self.clamp_confidence(cross_score + (spread_score * Decimal("0.25")) + (rsi_score * Decimal("0.15")))
+
+    @staticmethod
+    def spread_score(price: Decimal, fast_ema: float, slow_ema: float) -> Decimal:
+        if price <= 0:
+            return Decimal("0")
+        spread = abs(Decimal(str(fast_ema)) - Decimal(str(slow_ema))) / price
+        return min(Decimal("1"), spread / Decimal("0.002"))
+
+    @staticmethod
+    def clamp_confidence(value: Decimal) -> Decimal:
+        return max(Decimal("0"), min(Decimal("1"), value))
 
 
 class SmcStrategy:
@@ -122,19 +174,91 @@ class SmcStrategy:
         }
 
         if bearish_bos and bearish_displacement:
-            return Signal("sell", "SMC bearish break of structure with displacement.", current_price, indicators)
+            confidence = self.bearish_confidence(bearish_bos, bearish_displacement, bearish_structure, latest_candle.close < latest_candle.open)
+            return Signal(
+                "sell",
+                "SMC bearish break of structure with displacement.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         if bearish_structure and latest_candle.close < last_low.price:
-            return Signal("sell", "SMC bearish market structure invalidated the long thesis.", current_price, indicators)
+            confidence = self.bearish_confidence(True, bearish_displacement, bearish_structure, latest_candle.close < latest_candle.open)
+            return Signal(
+                "sell",
+                "SMC bearish market structure invalidated the long thesis.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         fvg_ok = bullish_fvg or not self.config.smc_require_fvg
         if bullish_bos and bullish_displacement and fvg_ok:
-            return Signal("buy", "SMC bullish break of structure with displacement.", current_price, indicators)
+            confidence = self.bullish_bos_confidence(bullish_bos, bullish_displacement, bullish_structure, bullish_fvg, bullish_order_block is not None)
+            return Signal(
+                "buy",
+                "SMC bullish break of structure with displacement.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         if bullish_structure and bullish_order_block and in_order_block and fvg_ok and latest_candle.close > latest_candle.open:
-            return Signal("buy", "SMC pullback into bullish order block with bullish structure.", current_price, indicators)
+            confidence = self.bullish_pullback_confidence(bullish_structure, in_order_block, bullish_fvg, latest_candle.close > latest_candle.open)
+            return Signal(
+                "buy",
+                "SMC pullback into bullish order block with bullish structure.",
+                current_price,
+                {**indicators, "confidence": float(confidence)},
+                confidence,
+            )
 
         return Signal("hold", "No SMC entry or exit signal.", current_price, indicators)
+
+    @staticmethod
+    def bullish_bos_confidence(
+        bullish_bos: bool,
+        bullish_displacement: bool,
+        bullish_structure: bool,
+        bullish_fvg: bool,
+        has_order_block: bool,
+    ) -> Decimal:
+        score = Decimal("0")
+        score += Decimal("0.35") if bullish_bos else Decimal("0")
+        score += Decimal("0.25") if bullish_displacement else Decimal("0")
+        score += Decimal("0.20") if bullish_structure else Decimal("0")
+        score += Decimal("0.10") if bullish_fvg else Decimal("0")
+        score += Decimal("0.10") if has_order_block else Decimal("0")
+        return min(Decimal("1"), score)
+
+    @staticmethod
+    def bullish_pullback_confidence(
+        bullish_structure: bool,
+        in_order_block: bool,
+        bullish_fvg: bool,
+        bullish_candle: bool,
+    ) -> Decimal:
+        score = Decimal("0")
+        score += Decimal("0.30") if bullish_structure else Decimal("0")
+        score += Decimal("0.35") if in_order_block else Decimal("0")
+        score += Decimal("0.20") if bullish_fvg else Decimal("0")
+        score += Decimal("0.15") if bullish_candle else Decimal("0")
+        return min(Decimal("1"), score)
+
+    @staticmethod
+    def bearish_confidence(
+        bearish_bos: bool,
+        bearish_displacement: bool,
+        bearish_structure: bool,
+        bearish_candle: bool,
+    ) -> Decimal:
+        score = Decimal("0")
+        score += Decimal("0.40") if bearish_bos else Decimal("0")
+        score += Decimal("0.25") if bearish_displacement else Decimal("0")
+        score += Decimal("0.25") if bearish_structure else Decimal("0")
+        score += Decimal("0.10") if bearish_candle else Decimal("0")
+        return min(Decimal("1"), score)
 
     def find_swings(self, candles: list[Candle]) -> tuple[list[SwingPoint], list[SwingPoint]]:
         lookback = self.config.smc_swing_lookback
