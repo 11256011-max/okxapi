@@ -56,11 +56,17 @@ class BotConfig:
     poll_seconds: int
     market_type: str
     leverage: Decimal
+    strategy: str
     fast_ema: int
     slow_ema: int
     rsi_period: int
     rsi_buy_max: Decimal
     rsi_sell_min: Decimal
+    smc_swing_lookback: int
+    smc_zone_lookback: int
+    smc_zone_tolerance_pct: Decimal
+    smc_min_displacement_pct: Decimal
+    smc_require_fvg: bool
     order_quote_amount: Decimal
     max_quote_per_order: Decimal
     max_daily_notional: Decimal
@@ -85,11 +91,17 @@ class BotConfig:
             poll_seconds=env_int("POLL_SECONDS", 60),
             market_type=os.getenv("MARKET_TYPE", "spot").strip().lower(),
             leverage=env_decimal("LEVERAGE", "1"),
+            strategy=os.getenv("STRATEGY", "ema_rsi").strip().lower(),
             fast_ema=env_int("FAST_EMA", 9),
             slow_ema=env_int("SLOW_EMA", 21),
             rsi_period=env_int("RSI_PERIOD", 14),
             rsi_buy_max=env_decimal("RSI_BUY_MAX", "65"),
             rsi_sell_min=env_decimal("RSI_SELL_MIN", "70"),
+            smc_swing_lookback=env_int("SMC_SWING_LOOKBACK", 3),
+            smc_zone_lookback=env_int("SMC_ZONE_LOOKBACK", 40),
+            smc_zone_tolerance_pct=env_decimal("SMC_ZONE_TOLERANCE_PCT", "0.003"),
+            smc_min_displacement_pct=env_decimal("SMC_MIN_DISPLACEMENT_PCT", "0.002"),
+            smc_require_fvg=env_bool("SMC_REQUIRE_FVG", False),
             order_quote_amount=env_decimal("ORDER_QUOTE_AMOUNT", "10"),
             max_quote_per_order=env_decimal("MAX_QUOTE_PER_ORDER", "10"),
             max_daily_notional=env_decimal("MAX_DAILY_NOTIONAL", "50"),
@@ -108,12 +120,25 @@ class BotConfig:
             raise ConfigError("This starter bot is spot-only. Keep MARKET_TYPE=spot.")
         if self.leverage != Decimal("1"):
             raise ConfigError("This starter bot does not use leverage. Keep LEVERAGE=1.")
-        if self.fast_ema <= 1 or self.slow_ema <= 1:
-            raise ConfigError("FAST_EMA and SLOW_EMA must be greater than 1.")
-        if self.fast_ema >= self.slow_ema:
-            raise ConfigError("FAST_EMA must be smaller than SLOW_EMA.")
-        if self.candle_limit < max(self.slow_ema, self.rsi_period) + 5:
-            raise ConfigError("CANDLE_LIMIT is too small for the configured indicators.")
+        if self.strategy not in {"ema_rsi", "smc"}:
+            raise ConfigError("STRATEGY must be one of: ema_rsi, smc.")
+        if self.strategy == "ema_rsi":
+            if self.fast_ema <= 1 or self.slow_ema <= 1:
+                raise ConfigError("FAST_EMA and SLOW_EMA must be greater than 1.")
+            if self.fast_ema >= self.slow_ema:
+                raise ConfigError("FAST_EMA must be smaller than SLOW_EMA.")
+            if self.candle_limit < max(self.slow_ema, self.rsi_period) + 5:
+                raise ConfigError("CANDLE_LIMIT is too small for the configured indicators.")
+        if self.strategy == "smc":
+            if self.smc_swing_lookback < 2:
+                raise ConfigError("SMC_SWING_LOOKBACK must be at least 2.")
+            if self.smc_zone_lookback < 5:
+                raise ConfigError("SMC_ZONE_LOOKBACK must be at least 5.")
+            if self.smc_zone_tolerance_pct < 0 or self.smc_min_displacement_pct < 0:
+                raise ConfigError("SMC percentage settings cannot be negative.")
+            minimum_smc_candles = (self.smc_swing_lookback * 2) + self.smc_zone_lookback + 5
+            if self.candle_limit < minimum_smc_candles:
+                raise ConfigError(f"CANDLE_LIMIT must be at least {minimum_smc_candles} for SMC.")
         if self.order_quote_amount <= 0:
             raise ConfigError("ORDER_QUOTE_AMOUNT must be greater than 0.")
         if self.max_quote_per_order <= 0 or self.max_daily_notional <= 0:
@@ -132,4 +157,3 @@ class BotConfig:
             raise ConfigError(
                 "Live trading is blocked. Set ENABLE_LIVE_TRADING=true only after testing dry-run and demo mode."
             )
-

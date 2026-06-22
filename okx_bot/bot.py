@@ -9,14 +9,14 @@ from .exchange import create_exchange
 from .models import Candle, Signal
 from .risk import RiskError, RiskManager
 from .state import BotState
-from .strategy import EmaRsiStrategy
+from .strategy import create_strategy
 
 
 class TradingBot:
     def __init__(self, config: BotConfig) -> None:
         self.config = config
         self.exchange = create_exchange(config)
-        self.strategy = EmaRsiStrategy(config)
+        self.strategy = create_strategy(config)
         self.risk = RiskManager(config)
         self.state = BotState.load(config.state_file)
 
@@ -185,4 +185,3 @@ class TradingBot:
     @staticmethod
     def quantize_amount(value: Decimal) -> Decimal:
         return value.quantize(Decimal("0.00000001"), rounding=ROUND_DOWN)
-

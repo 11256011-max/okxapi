@@ -27,7 +27,12 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(config.dry_run)
             self.assertTrue(config.okx_simulated_trading)
 
+    def test_unknown_strategy_is_rejected(self) -> None:
+        with patch.dict(os.environ, {"STRATEGY": "unknown"}, clear=True):
+            config = BotConfig.from_env()
+            with self.assertRaises(ConfigError):
+                config.validate()
+
 
 if __name__ == "__main__":
     unittest.main()
-
