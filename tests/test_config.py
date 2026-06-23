@@ -62,6 +62,19 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(ConfigError):
                 config.validate()
 
+    def test_symbol_exit_settings_resolve_base_symbol(self) -> None:
+        env = {
+            "SYMBOL_STOP_LOSS_PCTS": "ETH:0.015",
+            "SYMBOL_TAKE_PROFIT_PCTS": "ETH:0.06",
+        }
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
+            config = BotConfig.from_env()
+            config.validate()
+            self.assertEqual(str(config.stop_loss_pct_for_symbol("ETH/USDT:USDT")), "0.015")
+            self.assertEqual(str(config.take_profit_pct_for_symbol("ETH/USDT:USDT")), "0.06")
+            self.assertEqual(str(config.stop_loss_pct_for_symbol("BTC/USDT:USDT")), "0.02")
+            self.assertEqual(str(config.take_profit_pct_for_symbol("BTC/USDT:USDT")), "0.04")
+
     def test_external_context_cache_defaults_to_five_minutes(self) -> None:
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {}, clear=True):
             config = BotConfig.from_env()

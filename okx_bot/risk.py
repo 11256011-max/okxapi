@@ -19,10 +19,11 @@ class RiskManager:
         position_side = state.get_position_side(symbol)
         if position_base <= 0 or entry_price <= 0:
             return False
+        stop_loss_pct = self.config.stop_loss_pct_for_symbol(symbol)
         if position_side == "short":
-            stop_price = entry_price * (Decimal("1") + self.config.stop_loss_pct)
+            stop_price = entry_price * (Decimal("1") + stop_loss_pct)
             return current_price >= stop_price
-        stop_price = entry_price * (Decimal("1") - self.config.stop_loss_pct)
+        stop_price = entry_price * (Decimal("1") - stop_loss_pct)
         return current_price <= stop_price
 
     def take_profit_hit(self, state: BotState, symbol: str, current_price: Decimal) -> bool:
@@ -31,8 +32,9 @@ class RiskManager:
         position_side = state.get_position_side(symbol)
         if position_base <= 0 or entry_price <= 0:
             return False
+        take_profit_pct = self.config.take_profit_pct_for_symbol(symbol)
         if position_side == "short":
-            target_price = entry_price * (Decimal("1") - self.config.take_profit_pct)
+            target_price = entry_price * (Decimal("1") - take_profit_pct)
             return current_price <= target_price
-        target_price = entry_price * (Decimal("1") + self.config.take_profit_pct)
+        target_price = entry_price * (Decimal("1") + take_profit_pct)
         return current_price >= target_price

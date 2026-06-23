@@ -173,9 +173,22 @@ class BotConfig:
     order_quote_amount: Decimal
     max_quote_per_order: Decimal
     stop_loss_pct: Decimal
+    symbol_stop_loss_pcts: dict[str, Decimal]
     take_profit_pct: Decimal
+    symbol_take_profit_pcts: dict[str, Decimal]
     attach_tp_sl: bool
     sell_fraction: Decimal
+    dynamic_exit_enabled: bool
+    dynamic_exit_symbols: list[str]
+    dynamic_exit_atr_period: int
+    dynamic_exit_structure_lookback: int
+    dynamic_exit_min_stop_pct: Decimal
+    dynamic_exit_max_stop_pct: Decimal
+    dynamic_exit_atr_multiplier: Decimal
+    dynamic_exit_base_rr: Decimal
+    dynamic_exit_strong_rr: Decimal
+    dynamic_exit_strong_confidence: Decimal
+    dynamic_exit_trend_ma_period: int
     backtest_fee_pct: Decimal
     backtest_slippage_pct: Decimal
     backtest_funding_rate_8h: Decimal
@@ -259,9 +272,22 @@ class BotConfig:
             order_quote_amount=env_decimal("ORDER_QUOTE_AMOUNT", "10"),
             max_quote_per_order=env_decimal("MAX_QUOTE_PER_ORDER", "10"),
             stop_loss_pct=env_decimal("STOP_LOSS_PCT", "0.02"),
+            symbol_stop_loss_pcts=env_score_map("SYMBOL_STOP_LOSS_PCTS"),
             take_profit_pct=env_decimal("TAKE_PROFIT_PCT", "0.04"),
+            symbol_take_profit_pcts=env_score_map("SYMBOL_TAKE_PROFIT_PCTS"),
             attach_tp_sl=env_bool("ATTACH_TP_SL", True),
             sell_fraction=env_decimal("SELL_FRACTION", "1"),
+            dynamic_exit_enabled=env_bool("DYNAMIC_EXIT_ENABLED", True),
+            dynamic_exit_symbols=env_list("DYNAMIC_EXIT_SYMBOLS", "ETH"),
+            dynamic_exit_atr_period=env_int("DYNAMIC_EXIT_ATR_PERIOD", 14),
+            dynamic_exit_structure_lookback=env_int("DYNAMIC_EXIT_STRUCTURE_LOOKBACK", 20),
+            dynamic_exit_min_stop_pct=env_probability("DYNAMIC_EXIT_MIN_STOP_PCT", "0.012"),
+            dynamic_exit_max_stop_pct=env_probability("DYNAMIC_EXIT_MAX_STOP_PCT", "0.030"),
+            dynamic_exit_atr_multiplier=env_decimal("DYNAMIC_EXIT_ATR_MULTIPLIER", "1.2"),
+            dynamic_exit_base_rr=env_decimal("DYNAMIC_EXIT_BASE_RR", "2.0"),
+            dynamic_exit_strong_rr=env_decimal("DYNAMIC_EXIT_STRONG_RR", "4.0"),
+            dynamic_exit_strong_confidence=env_probability("DYNAMIC_EXIT_STRONG_CONFIDENCE", "0.70"),
+            dynamic_exit_trend_ma_period=env_int("DYNAMIC_EXIT_TREND_MA_PERIOD", 20),
             backtest_fee_pct=env_probability("BACKTEST_FEE_PCT", "0.0005"),
             backtest_slippage_pct=env_probability("BACKTEST_SLIPPAGE_PCT", "0.0005"),
             backtest_funding_rate_8h=env_probability("BACKTEST_FUNDING_RATE_8H", "0.0001"),
@@ -285,6 +311,18 @@ class BotConfig:
             if candidate in self.symbol_confidence_thresholds:
                 return self.symbol_confidence_thresholds[candidate]
         return self.signal_confidence_threshold
+
+    def stop_loss_pct_for_symbol(self, symbol: str) -> Decimal:
+        for candidate in self.symbol_threshold_candidates(symbol):
+            if candidate in self.symbol_stop_loss_pcts:
+                return self.symbol_stop_loss_pcts[candidate]
+        return self.stop_loss_pct
+
+    def take_profit_pct_for_symbol(self, symbol: str) -> Decimal:
+        for candidate in self.symbol_threshold_candidates(symbol):
+            if candidate in self.symbol_take_profit_pcts:
+                return self.symbol_take_profit_pcts[candidate]
+        return self.take_profit_pct
 
     @staticmethod
     def symbol_threshold_candidates(symbol: str) -> list[str]:
@@ -394,8 +432,28 @@ class BotConfig:
             raise ConfigError("SELL_FRACTION must be between 0 and 1.")
         if self.stop_loss_pct <= 0 or self.take_profit_pct <= 0:
             raise ConfigError("STOP_LOSS_PCT and TAKE_PROFIT_PCT must be greater than 0.")
+        for symbol, stop_loss_pct in self.symbol_stop_loss_pcts.items():
+            if stop_loss_pct <= 0:
+                raise ConfigError(f"SYMBOL_STOP_LOSS_PCTS for {symbol} must be greater than 0.")
+        for symbol, take_profit_pct in self.symbol_take_profit_pcts.items():
+            if take_profit_pct <= 0:
+                raise ConfigError(f"SYMBOL_TAKE_PROFIT_PCTS for {symbol} must be greater than 0.")
         if self.backtest_fee_pct < 0 or self.backtest_slippage_pct < 0 or self.backtest_funding_rate_8h < 0:
             raise ConfigError("Backtest fee, slippage, and funding settings cannot be negative.")
+        if self.dynamic_exit_atr_period < 2:
+            raise ConfigError("DYNAMIC_EXIT_ATR_PERIOD must be at least 2.")
+        if self.dynamic_exit_structure_lookback < 2:
+            raise ConfigError("DYNAMIC_EXIT_STRUCTURE_LOOKBACK must be at least 2.")
+        if self.dynamic_exit_trend_ma_period < 2:
+            raise ConfigError("DYNAMIC_EXIT_TREND_MA_PERIOD must be at least 2.")
+        if not Decimal("0") < self.dynamic_exit_min_stop_pct <= self.dynamic_exit_max_stop_pct:
+            raise ConfigError("DYNAMIC_EXIT_MIN_STOP_PCT must be greater than 0 and no larger than DYNAMIC_EXIT_MAX_STOP_PCT.")
+        if self.dynamic_exit_atr_multiplier <= 0 or self.dynamic_exit_base_rr <= 0 or self.dynamic_exit_strong_rr <= 0:
+            raise ConfigError("Dynamic exit multipliers and RR settings must be greater than 0.")
+        if self.dynamic_exit_strong_rr < self.dynamic_exit_base_rr:
+            raise ConfigError("DYNAMIC_EXIT_STRONG_RR must be greater than or equal to DYNAMIC_EXIT_BASE_RR.")
+        if not Decimal("0") <= self.dynamic_exit_strong_confidence <= Decimal("1"):
+            raise ConfigError("DYNAMIC_EXIT_STRONG_CONFIDENCE must be between 0 and 1, or 0 and 100 percent.")
         if require_private and not self.has_private_credentials:
             raise ConfigError("Private credentials are required for this command.")
         if require_order_submission:

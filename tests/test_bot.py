@@ -320,6 +320,28 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertEqual(take_profit, Decimal("96.00"))
         self.assertEqual(stop_loss, Decimal("102.00"))
 
+    def test_symbol_exit_prices_override_global_take_profit_and_stop_loss(self) -> None:
+        bot = make_bot({
+            "SYMBOL_STOP_LOSS_PCTS": "ETH:0.015",
+            "SYMBOL_TAKE_PROFIT_PCTS": "ETH:0.06",
+        })
+
+        take_profit, stop_loss = bot.exit_prices(Decimal("100"), "long", "ETH/USDT:USDT")
+
+        self.assertEqual(take_profit, Decimal("106.00"))
+        self.assertEqual(stop_loss, Decimal("98.500"))
+
+    def test_build_swap_position_plan_uses_symbol_stop_loss(self) -> None:
+        bot = make_bot({
+            "SYMBOL_STOP_LOSS_PCTS": "ETH:0.015",
+        })
+
+        plan = bot.build_swap_position_plan("ETH/USDT:USDT", Decimal("100"))
+
+        self.assertEqual(plan.risk_amount, Decimal("100.00"))
+        self.assertEqual(plan.leverage, 7)
+        self.assertEqual(plan.amount_contracts, Decimal("66.66666667"))
+
     def test_swap_order_attaches_short_take_profit_and_stop_loss(self) -> None:
         bot = make_bot({"DRY_RUN": "false", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"})
 
@@ -336,6 +358,27 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertEqual(order["params"]["positionSide"], "net")
         self.assertEqual(order["params"]["takeProfit"]["triggerPrice"], 96.0)
         self.assertEqual(order["params"]["stopLoss"]["triggerPrice"], 102.0)
+
+    def test_swap_order_attaches_symbol_take_profit_and_stop_loss(self) -> None:
+        bot = make_bot({
+            "DRY_RUN": "false",
+            "OKX_API_KEY": "key",
+            "OKX_SECRET_KEY": "secret",
+            "OKX_PASSPHRASE": "pass",
+            "SYMBOL_STOP_LOSS_PCTS": "ETH:0.015",
+            "SYMBOL_TAKE_PROFIT_PCTS": "ETH:0.06",
+        })
+
+        order = bot.create_swap_market_order_with_tp_sl(
+            "ETH/USDT:USDT",
+            Decimal("2"),
+            Decimal("100"),
+            order_side="buy",
+            position_side="long",
+        )
+
+        self.assertEqual(order["params"]["takeProfit"]["triggerPrice"], 106.0)
+        self.assertEqual(order["params"]["stopLoss"]["triggerPrice"], 98.5)
 
     def test_position_mode_uses_detected_okx_net_mode(self) -> None:
         bot = make_bot(

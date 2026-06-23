@@ -12,6 +12,7 @@ from typing import Any
 import ccxt
 
 from .config import BotConfig
+from .exit_plan import build_exit_plan
 from .models import Candle, Signal
 from .strategy import create_strategy
 
@@ -235,7 +236,14 @@ class BacktestRunner:
 
             side = "long" if signal.action == "buy" else "short"
             entry_price = next_candle.open
-            take_profit_price, stop_loss_price = self.exit_prices(entry_price, side)
+            exit_plan = build_exit_plan(
+                self.config,
+                symbol,
+                entry_price,
+                side,
+                signal,
+                candles_by_timeframe[entry_timeframe],
+            )
             open_trade = OpenBacktestTrade(
                 symbol=symbol,
                 side=side,
@@ -243,8 +251,8 @@ class BacktestRunner:
                 entry_time=next_candle.timestamp,
                 entry_index=index + 1,
                 entry_price=entry_price,
-                take_profit_price=take_profit_price,
-                stop_loss_price=stop_loss_price,
+                take_profit_price=exit_plan.take_profit_price,
+                stop_loss_price=exit_plan.stop_loss_price,
                 confidence=signal.confidence,
                 reason=signal.reason,
             )
@@ -321,17 +329,6 @@ class BacktestRunner:
     @staticmethod
     def is_opposite_signal(trade: OpenBacktestTrade, signal: Signal) -> bool:
         return (trade.side == "long" and signal.action == "sell") or (trade.side == "short" and signal.action == "buy")
-
-    def exit_prices(self, entry_price: Decimal, side: str) -> tuple[Decimal, Decimal]:
-        if side == "short":
-            return (
-                entry_price * (Decimal("1") - self.config.take_profit_pct),
-                entry_price * (Decimal("1") + self.config.stop_loss_pct),
-            )
-        return (
-            entry_price * (Decimal("1") + self.config.take_profit_pct),
-            entry_price * (Decimal("1") - self.config.stop_loss_pct),
-        )
 
     @staticmethod
     def gross_pnl_pct(side: str, entry_price: Decimal, exit_price: Decimal) -> Decimal:

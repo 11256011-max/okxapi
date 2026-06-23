@@ -7,6 +7,7 @@ from typing import Any
 
 from .config import BotConfig
 from .exchange import create_exchange
+from .exit_plan import build_exit_plan
 from .external_context import ExternalContextService
 from .models import Candle, Signal
 from .risk import RiskError, RiskManager
@@ -190,7 +191,7 @@ class TradingBot:
         if position_side == "long":
             self.add_to_swap_position_if_allowed(symbol, signal, "long", "buy", candles)
             return
-        self.open_swap_position(symbol, signal, position_side="long", order_side="buy")
+        self.open_swap_position(symbol, signal, position_side="long", order_side="buy", candles=candles)
 
     def sell_swap(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
         position_side = self.state.get_position_side(symbol)
@@ -200,7 +201,7 @@ class TradingBot:
         if position_side == "short":
             self.add_to_swap_position_if_allowed(symbol, signal, "short", "sell", candles)
             return
-        self.open_swap_position(symbol, signal, position_side="short", order_side="sell")
+        self.open_swap_position(symbol, signal, position_side="short", order_side="sell", candles=candles)
 
     def add_to_swap_position_if_allowed(
         self,
@@ -229,6 +230,7 @@ class TradingBot:
             order_side=order_side,
             size_multiplier=self.config.add_position_quote_fraction,
             action_label="add",
+            candles=candles,
         )
 
     def evaluate_add_position(
@@ -288,19 +290,24 @@ class TradingBot:
         order_side: str,
         size_multiplier: Decimal = Decimal("1"),
         action_label: str = "open",
+        candles: list[Candle] | None = None,
     ) -> None:
+        exit_plan = build_exit_plan(self.config, symbol, signal.price, position_side, signal, candles)
         try:
-            plan = self.build_swap_position_plan(symbol, signal.price, size_multiplier=size_multiplier)
+            plan = self.build_swap_position_plan(
+                symbol,
+                signal.price,
+                size_multiplier=size_multiplier,
+                stop_loss_pct=exit_plan.stop_loss_pct,
+            )
             self.assert_daily_loss_limit_not_hit(plan.equity)
         except RiskError as exc:
             logging.warning("Swap %s blocked by risk manager: %s", order_side, exc)
             return
 
-        take_profit_price, stop_loss_price = self.exit_prices(signal.price, position_side)
-
         if self.config.dry_run:
             logging.info(
-                "[DRY RUN] Would %s %s %s: contracts=%s notional=%s margin_budget=%s leverage=%sx risk_amount=%s TP=%s SL=%s.",
+                "[DRY RUN] Would %s %s %s: contracts=%s notional=%s margin_budget=%s leverage=%sx risk_amount=%s TP=%s SL=%s exit_rr=%s dynamic_exit=%s.",
                 action_label,
                 symbol,
                 position_side,
@@ -309,8 +316,10 @@ class TradingBot:
                 plan.margin_budget,
                 plan.leverage,
                 plan.risk_amount,
-                take_profit_price,
-                stop_loss_price,
+                exit_plan.take_profit_price,
+                exit_plan.stop_loss_price,
+                exit_plan.reward_risk,
+                exit_plan.dynamic,
             )
             self.state.record_trade(
                 order_side,
@@ -332,6 +341,8 @@ class TradingBot:
                 signal.price,
                 order_side=order_side,
                 position_side=position_side,
+                take_profit_price=exit_plan.take_profit_price,
+                stop_loss_price=exit_plan.stop_loss_price,
             )
         except Exception as exc:
             logging.warning("Swap %s failed due to order execution error: %s", order_side, exc)
@@ -414,6 +425,7 @@ class TradingBot:
         symbol: str,
         entry_price: Decimal,
         size_multiplier: Decimal = Decimal("1"),
+        stop_loss_pct: Decimal | None = None,
     ) -> SwapPositionPlan:
         if entry_price <= 0:
             raise RiskError("Entry price must be greater than 0.")
@@ -425,7 +437,8 @@ class TradingBot:
             raise RiskError("Account equity is unavailable or zero.")
 
         risk_amount = equity * self.config.risk_per_trade_pct * size_multiplier
-        max_notional_by_risk = risk_amount / self.config.stop_loss_pct
+        stop_loss_pct = stop_loss_pct or self.config.stop_loss_pct_for_symbol(symbol)
+        max_notional_by_risk = risk_amount / stop_loss_pct
         order_quote_amount = self.config.order_quote_amount * size_multiplier
         margin_budget = min(order_quote_amount, self.config.max_quote_per_order, max_notional_by_risk)
         if margin_budget <= 0:
@@ -466,8 +479,11 @@ class TradingBot:
         entry_price: Decimal,
         order_side: str,
         position_side: str,
+        take_profit_price: Decimal | None = None,
+        stop_loss_price: Decimal | None = None,
     ) -> dict[str, Any]:
-        take_profit_price, stop_loss_price = self.exit_prices(entry_price, position_side)
+        if take_profit_price is None or stop_loss_price is None:
+            take_profit_price, stop_loss_price = self.exit_prices(entry_price, position_side, symbol)
         params = self.swap_order_params(position_side)
         if self.config.attach_tp_sl:
             params["takeProfit"] = {
@@ -640,13 +656,15 @@ class TradingBot:
     def close_action_for_symbol(self, symbol: str) -> str:
         return "buy" if self.state.get_position_side(symbol) == "short" else "sell"
 
-    def exit_prices(self, entry_price: Decimal, position_side: str = "long") -> tuple[Decimal, Decimal]:
+    def exit_prices(self, entry_price: Decimal, position_side: str = "long", symbol: str | None = None) -> tuple[Decimal, Decimal]:
+        stop_loss_pct = self.config.stop_loss_pct_for_symbol(symbol) if symbol else self.config.stop_loss_pct
+        take_profit_pct = self.config.take_profit_pct_for_symbol(symbol) if symbol else self.config.take_profit_pct
         if position_side == "short":
-            take_profit_price = entry_price * (Decimal("1") - self.config.take_profit_pct)
-            stop_loss_price = entry_price * (Decimal("1") + self.config.stop_loss_pct)
+            take_profit_price = entry_price * (Decimal("1") - take_profit_pct)
+            stop_loss_price = entry_price * (Decimal("1") + stop_loss_pct)
             return take_profit_price, stop_loss_price
-        take_profit_price = entry_price * (Decimal("1") + self.config.take_profit_pct)
-        stop_loss_price = entry_price * (Decimal("1") - self.config.stop_loss_pct)
+        take_profit_price = entry_price * (Decimal("1") + take_profit_pct)
+        stop_loss_price = entry_price * (Decimal("1") - stop_loss_pct)
         return take_profit_price, stop_loss_price
 
     def print_balance(self) -> None:
