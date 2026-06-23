@@ -29,6 +29,8 @@ def config(extra_env: dict[str, str] | None = None) -> BotConfig:
         "COMBINED_VOLUME_PROFILE_LOOKBACK": "40",
         "COMBINED_MIN_SCORE": "0.80",
         "COMBINED_MIN_EDGE": "0.10",
+        "ENTRY_TIMEFRAME": "30m",
+        "CONFIRMATION_TIMEFRAMES": "1h,4h",
         "EXTERNAL_CONTEXT_ENABLED": "false",
     }
     env.update(extra_env or {})
@@ -102,6 +104,38 @@ class StrategyTests(unittest.TestCase):
 
         self.assertEqual(signal.action, "hold")
         self.assertLess(signal.confidence, Decimal("0.80"))
+
+    def test_multi_timeframe_generates_buy_when_entry_and_higher_timeframes_align(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config())
+        buy_candles = range_candles()
+        buy_candles.append(candle(80, "100.2", "105.2", "98.4", "104.7", "35"))
+
+        signal = strategy.generate_multi({
+            "30m": buy_candles,
+            "1h": buy_candles,
+            "4h": buy_candles,
+        })
+
+        self.assertEqual(signal.action, "buy")
+        self.assertGreaterEqual(signal.confidence, Decimal("0.80"))
+        self.assertEqual(signal.indicators["higher_timeframe_bullish_alignment"], 1.0)
+        self.assertIn("Multi-timeframe long", signal.reason)
+
+    def test_multi_timeframe_holds_when_higher_timeframe_disagrees(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config())
+        buy_candles = range_candles()
+        buy_candles.append(candle(80, "100.2", "105.2", "98.4", "104.7", "35"))
+        sell_candles = range_candles()
+        sell_candles.append(candle(80, "101.6", "103.9", "96.2", "97.0", "35"))
+
+        signal = strategy.generate_multi({
+            "30m": buy_candles,
+            "1h": buy_candles,
+            "4h": sell_candles,
+        })
+
+        self.assertEqual(signal.action, "hold")
+        self.assertEqual(signal.indicators["higher_timeframe_bullish_alignment"], 0.0)
 
 
 if __name__ == "__main__":

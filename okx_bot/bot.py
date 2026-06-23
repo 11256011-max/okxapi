@@ -38,15 +38,16 @@ class TradingBot:
         self.state.reset_daily_if_needed()
         for symbol in self.config.symbols:
             try:
-                candles = self.fetch_candles(symbol)
+                candles_by_timeframe = self.fetch_analysis_candles(symbol)
             except Exception as exc:
                 logging.warning("Skipping %s because candle fetch failed: %s", symbol, exc)
                 continue
 
-            signal = self.strategy.generate(candles)
+            signal = self.strategy.generate_multi(candles_by_timeframe)
             signal = self.apply_external_context_filter(symbol, signal)
             signal = self.apply_signal_confidence_gate(signal)
             signal = self.apply_position_risk(symbol, signal)
+            entry_candles = candles_by_timeframe[self.config.entry_timeframe]
 
             logging.info(
                 "Symbol=%s Signal=%s confidence=%s price=%s reason=%s indicators=%s",
@@ -58,14 +59,21 @@ class TradingBot:
                 signal.indicators,
             )
 
-            self.execute_signal(symbol, signal, candles)
+            self.execute_signal(symbol, signal, entry_candles)
 
         self.state.save(self.config.state_file)
 
-    def fetch_candles(self, symbol: str) -> list[Candle]:
+    def fetch_analysis_candles(self, symbol: str) -> dict[str, list[Candle]]:
+        return {
+            timeframe: self.fetch_candles(symbol, timeframe)
+            for timeframe in self.config.analysis_timeframes
+        }
+
+    def fetch_candles(self, symbol: str, timeframe: str | None = None) -> list[Candle]:
+        timeframe = timeframe or self.config.entry_timeframe
         raw_candles = self.exchange.fetch_ohlcv(
             symbol,
-            timeframe=self.config.timeframe,
+            timeframe=timeframe,
             limit=self.config.candle_limit,
         )
         candles = [

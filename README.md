@@ -119,6 +119,12 @@ Signal=hold confidence=74.00% reason=BUY signal blocked because confidence 74.00
 
 目前只有一個策略：`combined`。舊的 `STRATEGY=ema_rsi` 或 `STRATEGY=smc` 會自動映射到 `combined`，不會再跑舊策略。
 
+策略使用多週期判斷：
+
+- `30m`：進場週期，判斷 order flow、liquidity sweep、anchored VWAP、volume profile、SMC 進場條件。
+- `1h`：確認中期方向，避免 30m 訊號逆著更高週期交易。
+- `4h`：確認主要結構與大方向。
+
 它會把五個模組合併評分：
 
 - `order flow`：用 K 線方向、收盤位置與成交量估算買賣力道。
@@ -132,6 +138,8 @@ Signal=hold confidence=74.00% reason=BUY signal blocked because confidence 74.00
 設定：
 
 ```env
+ENTRY_TIMEFRAME=30m
+CONFIRMATION_TIMEFRAMES=1h,4h
 STRATEGY=combined
 SIGNAL_CONFIDENCE_THRESHOLD=0.80
 COMBINED_MIN_SCORE=0.80
@@ -149,6 +157,8 @@ COMBINED_MIN_DISPLACEMENT_PCT=0.002
 
 參數意思：
 
+- `ENTRY_TIMEFRAME`：實際找進場訊號的週期，預設 `30m`。
+- `CONFIRMATION_TIMEFRAMES`：高週期方向確認，預設 `1h,4h`。
 - `COMBINED_MIN_SCORE`：多方或空方整合分數至少要到多少才可能交易，`0.80` 代表 80%。
 - `COMBINED_MIN_EDGE`：多空分數差距至少要多少，避免多空分數太接近還下單。
 - `COMBINED_SWING_LOOKBACK`：左右各看幾根 K 線確認 swing high / low。

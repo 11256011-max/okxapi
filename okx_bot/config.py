@@ -41,6 +41,11 @@ def env_int(name: str, default: int) -> int:
     return int(raw)
 
 
+def env_list(name: str, default: str) -> list[str]:
+    raw = os.getenv(name, default)
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 def env_decimal(name: str, default: str) -> Decimal:
     raw = os.getenv(name, default)
     try:
@@ -108,6 +113,8 @@ class BotConfig:
     enable_live_trading: bool
     symbols: list[str]
     timeframe: str
+    entry_timeframe: str
+    confirmation_timeframes: list[str]
     candle_limit: int
     poll_seconds: int
     market_type: str
@@ -178,6 +185,7 @@ class BotConfig:
             symbols_raw = os.getenv("SYMBOL", "BTC/USDT")
         market_type = os.getenv("MARKET_TYPE", "swap").strip().lower()
         symbols = [normalize_symbol(s.strip().upper(), market_type) for s in symbols_raw.split(",") if s.strip()]
+        entry_timeframe = os.getenv("ENTRY_TIMEFRAME", os.getenv("TIMEFRAME", "30m")).strip()
         return cls(
             api_key=os.getenv("OKX_API_KEY", "").strip(),
             secret_key=os.getenv("OKX_SECRET_KEY", "").strip(),
@@ -186,7 +194,9 @@ class BotConfig:
             dry_run=env_bool("DRY_RUN", True),
             enable_live_trading=env_bool("ENABLE_LIVE_TRADING", False),
             symbols=symbols,
-            timeframe=os.getenv("TIMEFRAME", "1m").strip(),
+            timeframe=entry_timeframe,
+            entry_timeframe=entry_timeframe,
+            confirmation_timeframes=env_list("CONFIRMATION_TIMEFRAMES", "1h,4h"),
             candle_limit=env_int("CANDLE_LIMIT", 200),
             poll_seconds=env_int("POLL_SECONDS", 60),
             market_type=market_type,
@@ -254,6 +264,14 @@ class BotConfig:
     def has_private_credentials(self) -> bool:
         return bool(self.api_key and self.secret_key and self.passphrase)
 
+    @property
+    def analysis_timeframes(self) -> list[str]:
+        timeframes: list[str] = []
+        for timeframe in [self.entry_timeframe, *self.confirmation_timeframes]:
+            if timeframe and timeframe not in timeframes:
+                timeframes.append(timeframe)
+        return timeframes
+
     def validate(self, require_private: bool = False) -> None:
         if self.market_type != "swap":
             raise ConfigError("This bot is swap-only. Set MARKET_TYPE=swap.")
@@ -267,6 +285,10 @@ class BotConfig:
             raise ConfigError("DAILY_MAX_LOSS_PCT must be between 0 and 1, or 0 and 100 percent.")
         if self.strategy != "combined":
             raise ConfigError("STRATEGY must be combined. Legacy ema_rsi/smc values are mapped to combined automatically.")
+        if not self.entry_timeframe:
+            raise ConfigError("ENTRY_TIMEFRAME is required.")
+        if not self.confirmation_timeframes:
+            raise ConfigError("CONFIRMATION_TIMEFRAMES must include at least one higher timeframe.")
         if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
             raise ConfigError("SIGNAL_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
         if self.combined_swing_lookback < 2:

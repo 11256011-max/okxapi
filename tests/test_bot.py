@@ -18,6 +18,7 @@ class FakeExchange:
         self.leverage_max = leverage_max
         self.orders = []
         self.leverage_calls = []
+        self.ohlcv_calls = []
 
     def load_markets(self) -> None:
         return None
@@ -39,6 +40,20 @@ class FakeExchange:
             "total": {"USDT": self.equity},
             "free": {"USDT": self.equity},
         }
+
+    def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int):
+        self.ohlcv_calls.append((symbol, timeframe, limit))
+        return [
+            [
+                index * 60000,
+                100 + index,
+                101 + index,
+                99 + index,
+                100 + index,
+                10,
+            ]
+            for index in range(limit)
+        ]
 
     def fetch_position_mode(self):
         return {"hedged": self.hedged}
@@ -241,6 +256,18 @@ class BotExternalContextTests(unittest.TestCase):
 
 
 class BotSwapRiskTests(unittest.TestCase):
+    def test_fetch_analysis_candles_uses_entry_and_confirmation_timeframes(self) -> None:
+        bot = make_bot({
+            "ENTRY_TIMEFRAME": "30m",
+            "CONFIRMATION_TIMEFRAMES": "1h,4h",
+            "CANDLE_LIMIT": "100",
+        })
+
+        candles_by_timeframe = bot.fetch_analysis_candles("BTC/USDT:USDT")
+
+        self.assertEqual(set(candles_by_timeframe), {"30m", "1h", "4h"})
+        self.assertEqual([call[1] for call in bot.exchange.ohlcv_calls], ["30m", "1h", "4h"])
+
     def test_build_swap_position_plan_uses_one_percent_risk(self) -> None:
         bot = make_bot()
 

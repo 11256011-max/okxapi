@@ -33,6 +33,17 @@ class ComponentScores:
     bearish: Decimal
 
 
+@dataclass(frozen=True)
+class TimeframeEvaluation:
+    current_price: Decimal
+    bullish_score: Decimal
+    bearish_score: Decimal
+    edge: Decimal
+    indicators: dict[str, float]
+    ready: bool = True
+    reason: str = ""
+
+
 def create_strategy(config: BotConfig) -> "CombinedMarketStructureStrategy":
     return CombinedMarketStructureStrategy(config)
 
@@ -56,13 +67,116 @@ class CombinedMarketStructureStrategy:
         self.config = config
 
     def generate(self, candles: list[Candle]) -> Signal:
+        evaluation = self.evaluate_timeframe(candles)
+        if not evaluation.ready:
+            return Signal("hold", evaluation.reason, evaluation.current_price, evaluation.indicators)
+        return self.signal_from_evaluation(evaluation, "Combined")
+
+    def generate_multi(self, candles_by_timeframe: dict[str, list[Candle]]) -> Signal:
+        missing = [
+            timeframe
+            for timeframe in self.config.analysis_timeframes
+            if timeframe not in candles_by_timeframe
+        ]
+        if missing:
+            return Signal("hold", f"Missing timeframe candles: {', '.join(missing)}.", Decimal("0"))
+
+        evaluations: dict[str, TimeframeEvaluation] = {}
+        for timeframe in self.config.analysis_timeframes:
+            evaluation = self.evaluate_timeframe(candles_by_timeframe[timeframe])
+            if not evaluation.ready:
+                return Signal(
+                    "hold",
+                    f"{timeframe} not ready for multi-timeframe strategy. {evaluation.reason}",
+                    evaluation.current_price,
+                    self.prefix_indicators(timeframe, evaluation.indicators),
+                )
+            evaluations[timeframe] = evaluation
+
+        entry_timeframe = self.config.entry_timeframe
+        entry_evaluation = evaluations[entry_timeframe]
+        confirmation_timeframes = [
+            timeframe
+            for timeframe in self.config.confirmation_timeframes
+            if timeframe in evaluations and timeframe != entry_timeframe
+        ]
+
+        entry_weight = Decimal("0.50") if confirmation_timeframes else Decimal("1")
+        confirmation_weight = (Decimal("1") - entry_weight) / Decimal(len(confirmation_timeframes)) if confirmation_timeframes else Decimal("0")
+        bullish_score = entry_evaluation.bullish_score * entry_weight
+        bearish_score = entry_evaluation.bearish_score * entry_weight
+        for timeframe in confirmation_timeframes:
+            bullish_score += evaluations[timeframe].bullish_score * confirmation_weight
+            bearish_score += evaluations[timeframe].bearish_score * confirmation_weight
+
+        bullish_score = self.clamp(bullish_score)
+        bearish_score = self.clamp(bearish_score)
+        edge = abs(bullish_score - bearish_score)
+        bullish_aligned = all(
+            evaluations[timeframe].bullish_score >= evaluations[timeframe].bearish_score
+            for timeframe in confirmation_timeframes
+        )
+        bearish_aligned = all(
+            evaluations[timeframe].bearish_score >= evaluations[timeframe].bullish_score
+            for timeframe in confirmation_timeframes
+        )
+
+        indicators: dict[str, float] = {
+            "bullish_score": float(bullish_score),
+            "bearish_score": float(bearish_score),
+            "strategy_edge": float(edge),
+            "integrated_strategy_confidence": float(max(bullish_score, bearish_score)),
+            "entry_timeframe_weight": float(entry_weight),
+            "confirmation_timeframe_weight": float(confirmation_weight),
+            "higher_timeframe_bullish_alignment": 1.0 if bullish_aligned else 0.0,
+            "higher_timeframe_bearish_alignment": 1.0 if bearish_aligned else 0.0,
+        }
+        for timeframe, evaluation in evaluations.items():
+            indicators.update(self.prefix_indicators(timeframe, evaluation.indicators))
+
+        entry_bullish = entry_evaluation.bullish_score > entry_evaluation.bearish_score
+        entry_bearish = entry_evaluation.bearish_score > entry_evaluation.bullish_score
+
+        if (
+            bullish_score >= self.config.combined_min_score
+            and edge >= self.config.combined_min_edge
+            and bullish_score > bearish_score
+            and entry_bullish
+            and bullish_aligned
+        ):
+            reason = self.multi_timeframe_reason("long", bullish_score, edge, confirmation_timeframes)
+            return Signal("buy", reason, entry_evaluation.current_price, {**indicators, "confidence": float(bullish_score)}, bullish_score)
+
+        if (
+            bearish_score >= self.config.combined_min_score
+            and edge >= self.config.combined_min_edge
+            and bearish_score > bullish_score
+            and entry_bearish
+            and bearish_aligned
+        ):
+            reason = self.multi_timeframe_reason("short", bearish_score, edge, confirmation_timeframes)
+            return Signal("sell", reason, entry_evaluation.current_price, {**indicators, "confidence": float(bearish_score)}, bearish_score)
+
+        confidence = max(bullish_score, bearish_score)
+        reason = (
+            "Multi-timeframe strategy did not reach threshold, directional edge, or higher-timeframe alignment. "
+            f"bullish={self.format_percent(bullish_score)}, bearish={self.format_percent(bearish_score)}, "
+            f"edge={self.format_percent(edge)}."
+        )
+        return Signal("hold", reason, entry_evaluation.current_price, {**indicators, "confidence": float(confidence)}, confidence)
+
+    def evaluate_timeframe(self, candles: list[Candle]) -> TimeframeEvaluation:
         current_price = candles[-1].close if candles else Decimal("0")
         minimum_candles = self.minimum_candles()
         if len(candles) < minimum_candles:
-            return Signal(
-                "hold",
-                f"Not enough candles for combined strategy ({len(candles)} < {minimum_candles}).",
+            return TimeframeEvaluation(
                 current_price,
+                Decimal("0"),
+                Decimal("0"),
+                Decimal("0"),
+                {},
+                ready=False,
+                reason=f"Not enough candles for combined strategy ({len(candles)} < {minimum_candles}).",
             )
 
         latest = candles[-1]
@@ -114,22 +228,44 @@ class CombinedMarketStructureStrategy:
             **profile_indicators,
             **smc_indicators,
         }
+        return TimeframeEvaluation(current_price, bullish_score, bearish_score, edge, indicators)
 
-        if bullish_score >= self.config.combined_min_score and edge >= self.config.combined_min_edge and bullish_score > bearish_score:
-            reason = self.reason("long", bullish_score, edge, indicators)
-            return Signal("buy", reason, current_price, {**indicators, "confidence": float(bullish_score)}, bullish_score)
+    def signal_from_evaluation(self, evaluation: TimeframeEvaluation, label: str) -> Signal:
+        if (
+            evaluation.bullish_score >= self.config.combined_min_score
+            and evaluation.edge >= self.config.combined_min_edge
+            and evaluation.bullish_score > evaluation.bearish_score
+        ):
+            reason = self.reason("long", evaluation.bullish_score, evaluation.edge, evaluation.indicators, label)
+            return Signal(
+                "buy",
+                reason,
+                evaluation.current_price,
+                {**evaluation.indicators, "confidence": float(evaluation.bullish_score)},
+                evaluation.bullish_score,
+            )
 
-        if bearish_score >= self.config.combined_min_score and edge >= self.config.combined_min_edge and bearish_score > bullish_score:
-            reason = self.reason("short", bearish_score, edge, indicators)
-            return Signal("sell", reason, current_price, {**indicators, "confidence": float(bearish_score)}, bearish_score)
+        if (
+            evaluation.bearish_score >= self.config.combined_min_score
+            and evaluation.edge >= self.config.combined_min_edge
+            and evaluation.bearish_score > evaluation.bullish_score
+        ):
+            reason = self.reason("short", evaluation.bearish_score, evaluation.edge, evaluation.indicators, label)
+            return Signal(
+                "sell",
+                reason,
+                evaluation.current_price,
+                {**evaluation.indicators, "confidence": float(evaluation.bearish_score)},
+                evaluation.bearish_score,
+            )
 
-        confidence = max(bullish_score, bearish_score)
+        confidence = max(evaluation.bullish_score, evaluation.bearish_score)
         reason = (
-            "Combined strategy score did not reach threshold or directional edge. "
-            f"bullish={self.format_percent(bullish_score)}, bearish={self.format_percent(bearish_score)}, "
-            f"edge={self.format_percent(edge)}."
+            f"{label} strategy score did not reach threshold or directional edge. "
+            f"bullish={self.format_percent(evaluation.bullish_score)}, bearish={self.format_percent(evaluation.bearish_score)}, "
+            f"edge={self.format_percent(evaluation.edge)}."
         )
-        return Signal("hold", reason, current_price, {**indicators, "confidence": float(confidence)}, confidence)
+        return Signal("hold", reason, evaluation.current_price, {**evaluation.indicators, "confidence": float(confidence)}, confidence)
 
     def order_flow_scores(self, candles: list[Candle]) -> ComponentScores:
         latest = candles[-1]
@@ -385,7 +521,7 @@ class CombinedMarketStructureStrategy:
             (self.config.combined_swing_lookback * 2) + 5,
         ) + 2
 
-    def reason(self, side: str, confidence: Decimal, edge: Decimal, indicators: dict[str, float]) -> str:
+    def reason(self, side: str, confidence: Decimal, edge: Decimal, indicators: dict[str, float], label: str = "Combined") -> str:
         suffix = "long" if side == "long" else "short"
         aligned = [
             "order flow" if indicators[f"order_flow_{'bullish' if side == 'long' else 'bearish'}_score"] >= 0.5 else "",
@@ -396,9 +532,25 @@ class CombinedMarketStructureStrategy:
         ]
         modules = ", ".join(item for item in aligned if item) or "mixed modules"
         return (
-            f"Combined {suffix} setup confirmed by {modules}. "
+            f"{label} {suffix} setup confirmed by {modules}. "
             f"Integrated confidence={self.format_percent(confidence)}, edge={self.format_percent(edge)}."
         )
+
+    def multi_timeframe_reason(self, side: str, confidence: Decimal, edge: Decimal, confirmation_timeframes: list[str]) -> str:
+        suffix = "long" if side == "long" else "short"
+        confirmations = ", ".join(confirmation_timeframes) if confirmation_timeframes else "no higher timeframe"
+        return (
+            f"Multi-timeframe {suffix} setup confirmed: {self.config.entry_timeframe} entry aligned with {confirmations}. "
+            f"Integrated confidence={self.format_percent(confidence)}, edge={self.format_percent(edge)}."
+        )
+
+    @staticmethod
+    def prefix_indicators(timeframe: str, indicators: dict[str, float]) -> dict[str, float]:
+        safe_timeframe = timeframe.replace("/", "_").replace(":", "_")
+        return {
+            f"{safe_timeframe}_{key}": value
+            for key, value in indicators.items()
+        }
 
     @staticmethod
     def average(values: list[Decimal]) -> Decimal:
