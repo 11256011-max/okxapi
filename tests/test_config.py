@@ -56,6 +56,18 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(str(config.confidence_threshold_for_symbol("ETH/USDT:USDT")), "0.68")
             self.assertEqual(str(config.confidence_threshold_for_symbol("SOL/USDT:USDT")), "0.68")
 
+    def test_action_confidence_threshold_keeps_longs_stricter(self) -> None:
+        env = {
+            "SIGNAL_CONFIDENCE_THRESHOLD": "0.68",
+            "LONG_CONFIDENCE_THRESHOLD": "0.72",
+            "SHORT_CONFIDENCE_THRESHOLD": "0.68",
+        }
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
+            config = BotConfig.from_env()
+            config.validate()
+            self.assertEqual(str(config.confidence_threshold_for_symbol_and_action("ETH/USDT:USDT", "buy")), "0.72")
+            self.assertEqual(str(config.confidence_threshold_for_symbol_and_action("ETH/USDT:USDT", "sell")), "0.68")
+
     def test_backtest_cost_settings_are_validated(self) -> None:
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"BACKTEST_FEE_PCT": "-0.1"}, clear=True):
             config = BotConfig.from_env()

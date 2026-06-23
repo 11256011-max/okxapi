@@ -111,6 +111,7 @@ class TradingBot:
             "strategy_confidence": float(signal.confidence),
             "external_context_score": float(snapshot.combined_score),
             "external_context_sources": float(snapshot.sources_used),
+            "risk_multiplier": float(signal.indicators.get("risk_multiplier", 1.0)),
         }
         self.add_optional_indicator(indicators, "newsapi_score", snapshot.newsapi_score)
         self.add_optional_indicator(indicators, "gdelt_score", snapshot.gdelt_score)
@@ -131,6 +132,8 @@ class TradingBot:
         direction = Decimal("1") if signal.action == "buy" else Decimal("-1")
         directional_support = snapshot.combined_score * direction
         indicators["external_context_support"] = float(directional_support)
+        risk_multiplier = self.external_context_risk_multiplier(snapshot.combined_score, snapshot.fear_greed_score, directional_support)
+        indicators["risk_multiplier"] = float(risk_multiplier)
         adjusted_confidence = self.clamp_decimal(
             signal.confidence + (directional_support * self.config.external_context_max_confidence_adjustment)
         )
@@ -144,17 +147,36 @@ class TradingBot:
             return Signal("hold", reason, signal.price, indicators, adjusted_confidence)
 
         indicators["confidence"] = float(adjusted_confidence)
+        risk_note = ""
+        if risk_multiplier < Decimal("1"):
+            risk_note = f" Risk multiplier reduced to {risk_multiplier} because external context is extreme or not supportive."
         reason = (
             f"{signal.reason} External context support="
             f"{directional_support.quantize(Decimal('0.01'))}, confidence adjusted to "
-            f"{self.format_confidence(adjusted_confidence)}."
+            f"{self.format_confidence(adjusted_confidence)}.{risk_note}"
         )
         return Signal(signal.action, reason, signal.price, indicators, adjusted_confidence)
+
+    def external_context_risk_multiplier(
+        self,
+        combined_score: Decimal,
+        fear_greed_score: Decimal | None,
+        directional_support: Decimal,
+    ) -> Decimal:
+        risk_multiplier = Decimal("1")
+        extreme_scores = [combined_score]
+        if fear_greed_score is not None:
+            extreme_scores.append(fear_greed_score)
+        if any(abs(score) >= self.config.external_context_extreme_threshold for score in extreme_scores):
+            risk_multiplier = min(risk_multiplier, self.config.external_context_risk_multiplier)
+        if directional_support < Decimal("0"):
+            risk_multiplier = min(risk_multiplier, self.config.external_context_risk_multiplier)
+        return risk_multiplier
 
     def apply_signal_confidence_gate(self, symbol: str, signal: Signal) -> Signal:
         if signal.action not in {"buy", "sell"}:
             return signal
-        threshold = self.config.confidence_threshold_for_symbol(symbol)
+        threshold = self.config.confidence_threshold_for_symbol_and_action(symbol, signal.action)
         if signal.confidence >= threshold:
             return signal
 
@@ -293,11 +315,12 @@ class TradingBot:
         candles: list[Candle] | None = None,
     ) -> None:
         exit_plan = build_exit_plan(self.config, symbol, signal.price, position_side, signal, candles)
+        risk_multiplier = self.signal_risk_multiplier(signal)
         try:
             plan = self.build_swap_position_plan(
                 symbol,
                 signal.price,
-                size_multiplier=size_multiplier,
+                size_multiplier=size_multiplier * risk_multiplier,
                 stop_loss_pct=exit_plan.stop_loss_pct,
             )
             self.assert_daily_loss_limit_not_hit(plan.equity)
@@ -461,6 +484,17 @@ class TradingBot:
             leverage=leverage,
             amount_contracts=amount_contracts,
         )
+
+    @staticmethod
+    def signal_risk_multiplier(signal: Signal) -> Decimal:
+        raw_value = signal.indicators.get("risk_multiplier", 1)
+        try:
+            multiplier = Decimal(str(raw_value))
+        except Exception:
+            return Decimal("1")
+        if multiplier <= 0:
+            return Decimal("1")
+        return min(multiplier, Decimal("1"))
 
     def max_allowed_leverage(self, symbol: str) -> int:
         self.exchange.load_markets()

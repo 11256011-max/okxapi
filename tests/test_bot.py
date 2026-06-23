@@ -205,6 +205,7 @@ class BotSignalGateTests(unittest.TestCase):
     def test_symbol_confidence_threshold_can_block_one_market(self) -> None:
         config = make_config({
             "SIGNAL_CONFIDENCE_THRESHOLD": "0.68",
+            "LONG_CONFIDENCE_THRESHOLD": "0.68",
             "SYMBOL_CONFIDENCE_THRESHOLDS": "BTC:0.72,ETH:0.68",
         })
         bot_like = object.__new__(TradingBot)
@@ -222,6 +223,23 @@ class BotSignalGateTests(unittest.TestCase):
 
         self.assertEqual(btc_signal.action, "hold")
         self.assertEqual(eth_signal.action, "buy")
+
+    def test_long_threshold_can_be_stricter_than_short_threshold(self) -> None:
+        config = make_config({
+            "SIGNAL_CONFIDENCE_THRESHOLD": "0.68",
+            "LONG_CONFIDENCE_THRESHOLD": "0.72",
+            "SHORT_CONFIDENCE_THRESHOLD": "0.68",
+        })
+        bot_like = object.__new__(TradingBot)
+        bot_like.config = config
+        buy_signal = Signal("buy", "Test buy signal.", Decimal("100"), {"confidence": 0.70}, Decimal("0.70"))
+        sell_signal = Signal("sell", "Test sell signal.", Decimal("100"), {"confidence": 0.70}, Decimal("0.70"))
+
+        gated_buy = TradingBot.apply_signal_confidence_gate(bot_like, "ETH/USDT:USDT", buy_signal)
+        gated_sell = TradingBot.apply_signal_confidence_gate(bot_like, "ETH/USDT:USDT", sell_signal)
+
+        self.assertEqual(gated_buy.action, "hold")
+        self.assertEqual(gated_sell.action, "sell")
 
 
 class BotExternalContextTests(unittest.TestCase):
@@ -261,6 +279,18 @@ class BotExternalContextTests(unittest.TestCase):
 
         self.assertEqual(adjusted.action, "sell")
         self.assertGreater(adjusted.confidence, signal.confidence)
+
+    def test_external_context_extreme_score_reduces_position_risk(self) -> None:
+        bot = make_bot({"EXTERNAL_CONTEXT_ENABLED": "true", "EXTERNAL_CONTEXT_EXTREME_THRESHOLD": "0.75", "EXTERNAL_CONTEXT_RISK_MULTIPLIER": "0.50"})
+        bot.external_context = FakeExternalContext(
+            ContextSnapshot(combined_score=Decimal("0.80"), fear_greed_score=Decimal("0.80"), sources_used=1)
+        )
+        signal = Signal("buy", "Strategy buy.", Decimal("100"), {}, Decimal("0.80"))
+
+        adjusted = bot.apply_external_context_filter("BTC/USDT:USDT", signal)
+
+        self.assertEqual(adjusted.action, "buy")
+        self.assertEqual(adjusted.indicators["risk_multiplier"], 0.5)
 
     def test_external_context_is_logged_for_hold_signal(self) -> None:
         bot = make_bot({"EXTERNAL_CONTEXT_ENABLED": "true"})
@@ -341,6 +371,14 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertEqual(plan.risk_amount, Decimal("100.00"))
         self.assertEqual(plan.leverage, 7)
         self.assertEqual(plan.amount_contracts, Decimal("66.66666667"))
+
+    def test_signal_risk_multiplier_reduces_position_size(self) -> None:
+        bot = make_bot()
+        signal = Signal("buy", "Risk reduced.", Decimal("100"), {"risk_multiplier": 0.5}, Decimal("1"))
+
+        bot.buy("BTC/USDT:USDT", signal)
+
+        self.assertEqual(bot.state.get_position_base("BTC/USDT:USDT"), Decimal("25"))
 
     def test_swap_order_attaches_short_take_profit_and_stop_loss(self) -> None:
         bot = make_bot({"DRY_RUN": "false", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"})

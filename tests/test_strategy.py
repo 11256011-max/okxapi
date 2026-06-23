@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from okx_bot.config import BotConfig
 from okx_bot.models import Candle
-from okx_bot.strategy import CombinedMarketStructureStrategy, TimeframeEvaluation, create_strategy
+from okx_bot.strategy import CombinedMarketStructureStrategy, MarketState, TimeframeEvaluation, create_strategy
 
 
 def candle(index: int, open_: str, high: str, low: str, close: str, volume: str = "10") -> Candle:
@@ -169,6 +169,146 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.confidence, Decimal("0.70"))
         self.assertEqual(signal.indicators["bullish_score"], 0.70)
         self.assertEqual(signal.indicators["higher_timeframe_bullish_alignment"], 1.0)
+
+    def test_layered_smc_generates_buy_only_after_market_and_entry_layers_align(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config({"LAYERED_SMC_ENABLED": "true"}))
+        entry = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.74"),
+            Decimal("0.20"),
+            Decimal("0.54"),
+            {
+                "smc_bullish_score": 0.80,
+                "smc_bearish_score": 0.10,
+                "bullish_bos": 1.0,
+                "liquidity_sweep_bullish_score": 1.0,
+                "order_flow_bullish_score": 0.60,
+                "anchored_vwap_bullish_score": 0.70,
+                "volume_profile_bullish_score": 0.20,
+            },
+        )
+        confirmation = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.60"),
+            Decimal("0.20"),
+            Decimal("0.40"),
+            {"smc_bullish_score": 0.60, "smc_bearish_score": 0.10},
+        )
+        tradable_market = MarketState(
+            direction="long",
+            trend_clear=True,
+            low_volatility=False,
+            ranging=False,
+            atr_pct=Decimal("0.01"),
+            ma_slope_pct=Decimal("0.01"),
+            range_pct=Decimal("0.04"),
+            current_ma=Decimal("101"),
+            previous_ma=Decimal("100"),
+        )
+
+        with patch.object(strategy, "evaluate_timeframe", side_effect=[entry, confirmation, confirmation]), patch.object(
+            strategy,
+            "market_state",
+            return_value=tradable_market,
+        ):
+            signal = strategy.generate_multi({
+                "30m": range_candles(),
+                "1h": range_candles(),
+                "4h": range_candles(),
+            })
+
+        self.assertEqual(signal.action, "buy")
+        self.assertGreaterEqual(signal.confidence, Decimal("0.68"))
+        self.assertEqual(signal.indicators["layered_smc_mode"], 1.0)
+        self.assertEqual(signal.indicators["layered_entry_liquidity_ok"], 1.0)
+        self.assertIn("Layered SMC long setup", signal.reason)
+
+    def test_layered_smc_holds_when_four_hour_market_is_not_tradable(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config({"LAYERED_SMC_ENABLED": "true"}))
+        evaluation = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.80"),
+            Decimal("0.10"),
+            Decimal("0.70"),
+            {"smc_bullish_score": 0.80, "smc_bearish_score": 0.10},
+        )
+        range_market = MarketState(
+            direction="neutral",
+            trend_clear=False,
+            low_volatility=True,
+            ranging=True,
+            atr_pct=Decimal("0.001"),
+            ma_slope_pct=Decimal("0.0001"),
+            range_pct=Decimal("0.005"),
+            current_ma=Decimal("100"),
+            previous_ma=Decimal("100"),
+        )
+
+        with patch.object(strategy, "evaluate_timeframe", side_effect=[evaluation, evaluation, evaluation]), patch.object(
+            strategy,
+            "market_state",
+            return_value=range_market,
+        ):
+            signal = strategy.generate_multi({
+                "30m": range_candles(),
+                "1h": range_candles(),
+                "4h": range_candles(),
+            })
+
+        self.assertEqual(signal.action, "hold")
+        self.assertEqual(signal.indicators["market_trend_clear"], 0.0)
+        self.assertIn("market state is not tradable", signal.reason)
+
+    def test_layered_smc_allows_smc_only_entry_without_optional_confirmations(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config({"LAYERED_SMC_ENABLED": "true"}))
+        entry = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.72"),
+            Decimal("0.10"),
+            Decimal("0.62"),
+            {
+                "smc_bullish_score": 0.72,
+                "smc_bearish_score": 0.00,
+                "bullish_bos": 1.0,
+                "liquidity_sweep_bullish_score": 0.0,
+                "order_flow_bullish_score": 0.0,
+                "anchored_vwap_bullish_score": 0.0,
+                "volume_profile_bullish_score": 0.0,
+            },
+        )
+        confirmation = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.60"),
+            Decimal("0.20"),
+            Decimal("0.40"),
+            {"smc_bullish_score": 0.60, "smc_bearish_score": 0.10},
+        )
+        tradable_market = MarketState(
+            direction="long",
+            trend_clear=True,
+            low_volatility=False,
+            ranging=False,
+            atr_pct=Decimal("0.01"),
+            ma_slope_pct=Decimal("0.01"),
+            range_pct=Decimal("0.04"),
+            current_ma=Decimal("101"),
+            previous_ma=Decimal("100"),
+        )
+
+        with patch.object(strategy, "evaluate_timeframe", side_effect=[entry, confirmation, confirmation]), patch.object(
+            strategy,
+            "market_state",
+            return_value=tradable_market,
+        ):
+            signal = strategy.generate_multi({
+                "30m": range_candles(),
+                "1h": range_candles(),
+                "4h": range_candles(),
+            })
+
+        self.assertEqual(signal.action, "buy")
+        self.assertEqual(signal.indicators["layered_optional_confirmation_count"], 0.0)
+        self.assertIn("SMC-only", signal.reason)
 
 
 if __name__ == "__main__":

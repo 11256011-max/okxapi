@@ -124,7 +124,20 @@ class BotConfig:
     daily_max_loss_pct: Decimal
     strategy: str
     signal_confidence_threshold: Decimal
+    long_confidence_threshold: Decimal
+    short_confidence_threshold: Decimal
     symbol_confidence_thresholds: dict[str, Decimal]
+    layered_smc_enabled: bool
+    layered_market_ma_period: int
+    layered_market_slope_lookback: int
+    layered_market_min_trend_pct: Decimal
+    layered_market_min_atr_pct: Decimal
+    layered_market_max_range_pct: Decimal
+    layered_entry_smc_min_score: Decimal
+    layered_entry_require_bos: bool
+    layered_entry_order_flow_min_score: Decimal
+    layered_entry_position_min_score: Decimal
+    layered_require_liquidity_sweep: bool
     combined_swing_lookback: int
     combined_structure_lookback: int
     combined_order_flow_lookback: int
@@ -158,6 +171,8 @@ class BotConfig:
     external_context_timeout_seconds: int
     external_context_max_confidence_adjustment: Decimal
     external_context_min_support: Decimal
+    external_context_extreme_threshold: Decimal
+    external_context_risk_multiplier: Decimal
     fear_greed_mode: str
     fundamental_bias: dict[str, Decimal]
     add_position_enabled: bool
@@ -223,7 +238,20 @@ class BotConfig:
             daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
             strategy=normalize_strategy(os.getenv("STRATEGY", "combined")),
             signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.68"),
+            long_confidence_threshold=env_probability("LONG_CONFIDENCE_THRESHOLD", "0.72"),
+            short_confidence_threshold=env_probability("SHORT_CONFIDENCE_THRESHOLD", "0.68"),
             symbol_confidence_thresholds=env_score_map("SYMBOL_CONFIDENCE_THRESHOLDS"),
+            layered_smc_enabled=env_bool("LAYERED_SMC_ENABLED", False),
+            layered_market_ma_period=env_int("LAYERED_MARKET_MA_PERIOD", 50),
+            layered_market_slope_lookback=env_int("LAYERED_MARKET_SLOPE_LOOKBACK", 10),
+            layered_market_min_trend_pct=env_probability("LAYERED_MARKET_MIN_TREND_PCT", "0.003"),
+            layered_market_min_atr_pct=env_probability("LAYERED_MARKET_MIN_ATR_PCT", "0.004"),
+            layered_market_max_range_pct=env_probability("LAYERED_MARKET_MAX_RANGE_PCT", "0.030"),
+            layered_entry_smc_min_score=env_probability("LAYERED_ENTRY_SMC_MIN_SCORE", "0.50"),
+            layered_entry_require_bos=env_bool("LAYERED_ENTRY_REQUIRE_BOS", True),
+            layered_entry_order_flow_min_score=env_probability("LAYERED_ENTRY_ORDER_FLOW_MIN_SCORE", "0.20"),
+            layered_entry_position_min_score=env_probability("LAYERED_ENTRY_POSITION_MIN_SCORE", "0.50"),
+            layered_require_liquidity_sweep=env_bool("LAYERED_REQUIRE_LIQUIDITY_SWEEP", False),
             combined_swing_lookback=env_int("COMBINED_SWING_LOOKBACK", 3),
             combined_structure_lookback=env_int("COMBINED_STRUCTURE_LOOKBACK", 40),
             combined_order_flow_lookback=env_int("COMBINED_ORDER_FLOW_LOOKBACK", 20),
@@ -257,6 +285,8 @@ class BotConfig:
             external_context_timeout_seconds=env_int("EXTERNAL_CONTEXT_TIMEOUT_SECONDS", 15),
             external_context_max_confidence_adjustment=env_probability("EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT", "0.15"),
             external_context_min_support=env_decimal("EXTERNAL_CONTEXT_MIN_SUPPORT", "-0.35"),
+            external_context_extreme_threshold=env_probability("EXTERNAL_CONTEXT_EXTREME_THRESHOLD", "0.75"),
+            external_context_risk_multiplier=env_probability("EXTERNAL_CONTEXT_RISK_MULTIPLIER", "0.50"),
             fear_greed_mode=os.getenv("FEAR_GREED_MODE", "momentum").strip().lower(),
             fundamental_bias=env_score_map("FUNDAMENTAL_BIAS"),
             add_position_enabled=env_bool("ADD_POSITION_ENABLED", True),
@@ -312,6 +342,14 @@ class BotConfig:
                 return self.symbol_confidence_thresholds[candidate]
         return self.signal_confidence_threshold
 
+    def confidence_threshold_for_symbol_and_action(self, symbol: str, action: str) -> Decimal:
+        threshold = self.confidence_threshold_for_symbol(symbol)
+        if action == "buy":
+            return max(threshold, self.long_confidence_threshold)
+        if action == "sell":
+            return max(threshold, self.short_confidence_threshold)
+        return threshold
+
     def stop_loss_pct_for_symbol(self, symbol: str) -> Decimal:
         for candidate in self.symbol_threshold_candidates(symbol):
             if candidate in self.symbol_stop_loss_pcts:
@@ -351,9 +389,25 @@ class BotConfig:
             raise ConfigError("CONFIRMATION_TIMEFRAMES must include at least one higher timeframe.")
         if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
             raise ConfigError("SIGNAL_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
+        if not Decimal("0") <= self.long_confidence_threshold <= Decimal("1"):
+            raise ConfigError("LONG_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
+        if not Decimal("0") <= self.short_confidence_threshold <= Decimal("1"):
+            raise ConfigError("SHORT_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
         for symbol, threshold in self.symbol_confidence_thresholds.items():
             if not Decimal("0") <= threshold <= Decimal("1"):
                 raise ConfigError(f"SYMBOL_CONFIDENCE_THRESHOLDS for {symbol} must be between 0 and 1, or 0 and 100 percent.")
+        if self.layered_market_ma_period < 2:
+            raise ConfigError("LAYERED_MARKET_MA_PERIOD must be at least 2.")
+        if self.layered_market_slope_lookback < 1:
+            raise ConfigError("LAYERED_MARKET_SLOPE_LOOKBACK must be at least 1.")
+        if self.layered_market_min_trend_pct < 0 or self.layered_market_min_atr_pct < 0 or self.layered_market_max_range_pct < 0:
+            raise ConfigError("Layered SMC market percentage settings cannot be negative.")
+        if not Decimal("0") <= self.layered_entry_smc_min_score <= Decimal("1"):
+            raise ConfigError("LAYERED_ENTRY_SMC_MIN_SCORE must be between 0 and 1.")
+        if not Decimal("0") <= self.layered_entry_order_flow_min_score <= Decimal("1"):
+            raise ConfigError("LAYERED_ENTRY_ORDER_FLOW_MIN_SCORE must be between 0 and 1.")
+        if not Decimal("0") <= self.layered_entry_position_min_score <= Decimal("1"):
+            raise ConfigError("LAYERED_ENTRY_POSITION_MIN_SCORE must be between 0 and 1.")
         if self.combined_swing_lookback < 2:
             raise ConfigError("COMBINED_SWING_LOOKBACK must be at least 2.")
         if self.combined_structure_lookback < 5:
@@ -380,6 +434,8 @@ class BotConfig:
             self.combined_avwap_lookback,
             self.combined_order_flow_lookback,
             (self.combined_swing_lookback * 2) + 5,
+            self.layered_market_ma_period + self.layered_market_slope_lookback + 2,
+            self.dynamic_exit_atr_period + 2,
         ) + 2
         if self.candle_limit < minimum_combined_candles:
             raise ConfigError(f"CANDLE_LIMIT must be at least {minimum_combined_candles} for the combined strategy.")
@@ -395,6 +451,10 @@ class BotConfig:
             raise ConfigError("EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT must be between 0 and 1.")
         if not Decimal("-1") <= self.external_context_min_support <= Decimal("1"):
             raise ConfigError("EXTERNAL_CONTEXT_MIN_SUPPORT must be between -1 and 1.")
+        if not Decimal("0") <= self.external_context_extreme_threshold <= Decimal("1"):
+            raise ConfigError("EXTERNAL_CONTEXT_EXTREME_THRESHOLD must be between 0 and 1.")
+        if not Decimal("0") < self.external_context_risk_multiplier <= Decimal("1"):
+            raise ConfigError("EXTERNAL_CONTEXT_RISK_MULTIPLIER must be greater than 0 and no more than 1.")
         if self.fear_greed_mode not in {"momentum", "contrarian"}:
             raise ConfigError("FEAR_GREED_MODE must be momentum or contrarian.")
         for symbol, score in self.fundamental_bias.items():

@@ -44,6 +44,27 @@ class TimeframeEvaluation:
     reason: str = ""
 
 
+@dataclass(frozen=True)
+class MarketState:
+    direction: str
+    trend_clear: bool
+    low_volatility: bool
+    ranging: bool
+    atr_pct: Decimal
+    ma_slope_pct: Decimal
+    range_pct: Decimal
+    current_ma: Decimal
+    previous_ma: Decimal
+
+
+@dataclass(frozen=True)
+class LayeredEntrySetup:
+    valid: bool
+    confidence: Decimal
+    reason: str
+    indicators: dict[str, float]
+
+
 def create_strategy(config: BotConfig) -> "CombinedMarketStructureStrategy":
     return CombinedMarketStructureStrategy(config)
 
@@ -92,6 +113,9 @@ class CombinedMarketStructureStrategy:
                     self.prefix_indicators(timeframe, evaluation.indicators),
                 )
             evaluations[timeframe] = evaluation
+
+        if self.config.layered_smc_enabled:
+            return self.generate_layered_smc(candles_by_timeframe, evaluations)
 
         entry_timeframe = self.config.entry_timeframe
         entry_evaluation = evaluations[entry_timeframe]
@@ -155,6 +179,208 @@ class CombinedMarketStructureStrategy:
             f"edge={self.format_percent(edge)}. Higher-timeframe filters={', '.join(confirmation_timeframes) or 'none'}."
         )
         return Signal("hold", reason, entry_evaluation.current_price, {**indicators, "confidence": float(confidence)}, confidence)
+
+    def generate_layered_smc(
+        self,
+        candles_by_timeframe: dict[str, list[Candle]],
+        evaluations: dict[str, TimeframeEvaluation],
+    ) -> Signal:
+        entry_timeframe = self.config.entry_timeframe
+        entry_evaluation = evaluations[entry_timeframe]
+        market_timeframe = "4h" if "4h" in evaluations else self.config.confirmation_timeframes[-1]
+        market = self.market_state(candles_by_timeframe[market_timeframe])
+        indicators = self.layered_base_indicators(evaluations, market_timeframe, market)
+
+        if not market.trend_clear:
+            confidence = max(entry_evaluation.bullish_score, entry_evaluation.bearish_score)
+            reason = (
+                f"Layered SMC hold: {market_timeframe} market state is not tradable "
+                f"(direction={market.direction}, slope={self.format_percent(abs(market.ma_slope_pct))}, "
+                f"ATR={self.format_percent(market.atr_pct)})."
+            )
+            return Signal("hold", reason, entry_evaluation.current_price, {**indicators, "confidence": float(confidence)}, confidence)
+
+        side = market.direction
+        if side not in {"long", "short"}:
+            confidence = max(entry_evaluation.bullish_score, entry_evaluation.bearish_score)
+            reason = f"Layered SMC hold: {market_timeframe} trend direction is neutral."
+            return Signal("hold", reason, entry_evaluation.current_price, {**indicators, "confidence": float(confidence)}, confidence)
+
+        aligned, alignment_reason, alignment_indicators = self.layered_direction_alignment(side, evaluations)
+        indicators.update(alignment_indicators)
+        if not aligned:
+            confidence = max(entry_evaluation.bullish_score, entry_evaluation.bearish_score)
+            reason = f"Layered SMC hold: {alignment_reason}"
+            return Signal("hold", reason, entry_evaluation.current_price, {**indicators, "confidence": float(confidence)}, confidence)
+
+        setup = self.layered_entry_setup(entry_evaluation, side)
+        indicators.update(setup.indicators)
+        indicators["confidence"] = float(setup.confidence)
+        if not setup.valid:
+            reason = f"Layered SMC hold: 30m entry not confirmed. {setup.reason}"
+            return Signal("hold", reason, entry_evaluation.current_price, indicators, setup.confidence)
+
+        action = "buy" if side == "long" else "sell"
+        reason = (
+            f"Layered SMC {side} setup: {market_timeframe} trend is tradable, "
+            f"higher timeframes align, and {entry_timeframe} entry confirms SMC/liquidity/order flow/value area. "
+            f"{setup.reason}"
+        )
+        return Signal(action, reason, entry_evaluation.current_price, indicators, setup.confidence)
+
+    def layered_base_indicators(
+        self,
+        evaluations: dict[str, TimeframeEvaluation],
+        market_timeframe: str,
+        market: MarketState,
+    ) -> dict[str, float]:
+        indicators: dict[str, float] = {
+            "layered_smc_mode": 1.0,
+            "market_direction": self.direction_value(market.direction),
+            "market_trend_clear": 1.0 if market.trend_clear else 0.0,
+            "market_low_volatility": 1.0 if market.low_volatility else 0.0,
+            "market_ranging": 1.0 if market.ranging else 0.0,
+            "market_atr_pct": float(market.atr_pct),
+            "market_ma_slope_pct": float(market.ma_slope_pct),
+            "market_range_pct": float(market.range_pct),
+            "market_current_ma": float(market.current_ma),
+            "market_previous_ma": float(market.previous_ma),
+            "market_timeframe_4h": 1.0 if market_timeframe == "4h" else 0.0,
+        }
+        for timeframe, evaluation in evaluations.items():
+            indicators.update(self.prefix_indicators(timeframe, evaluation.indicators))
+        return indicators
+
+    def market_state(self, candles: list[Candle]) -> MarketState:
+        latest = candles[-1]
+        period = self.config.layered_market_ma_period
+        slope_lookback = self.config.layered_market_slope_lookback
+        current_ma = self.average([candle.close for candle in candles[-period:]])
+        previous_ma = self.average([candle.close for candle in candles[-period - slope_lookback : -slope_lookback]])
+        ma_slope_pct = (current_ma - previous_ma) / latest.close if latest.close > 0 else Decimal("0")
+        atr = self.average_true_range(candles, self.config.dynamic_exit_atr_period)
+        atr_pct = atr / latest.close if latest.close > 0 else Decimal("0")
+        range_window = candles[-period:]
+        range_pct = (max(candle.high for candle in range_window) - min(candle.low for candle in range_window)) / latest.close if latest.close > 0 else Decimal("0")
+
+        if latest.close > current_ma and current_ma > previous_ma:
+            direction = "long"
+        elif latest.close < current_ma and current_ma < previous_ma:
+            direction = "short"
+        else:
+            direction = "neutral"
+
+        low_volatility = atr_pct < self.config.layered_market_min_atr_pct
+        slope_clear = abs(ma_slope_pct) >= self.config.layered_market_min_trend_pct
+        ranging = direction == "neutral" or (not slope_clear and range_pct <= self.config.layered_market_max_range_pct)
+        trend_clear = direction in {"long", "short"} and slope_clear and not low_volatility and not ranging
+        return MarketState(
+            direction=direction,
+            trend_clear=trend_clear,
+            low_volatility=low_volatility,
+            ranging=ranging,
+            atr_pct=atr_pct,
+            ma_slope_pct=ma_slope_pct,
+            range_pct=range_pct,
+            current_ma=current_ma,
+            previous_ma=previous_ma,
+        )
+
+    def layered_direction_alignment(
+        self,
+        side: str,
+        evaluations: dict[str, TimeframeEvaluation],
+    ) -> tuple[bool, str, dict[str, float]]:
+        indicators: dict[str, float] = {}
+        expected = "bullish" if side == "long" else "bearish"
+        mismatches: list[str] = []
+        for timeframe in self.config.confirmation_timeframes:
+            evaluation = evaluations.get(timeframe)
+            if evaluation is None:
+                continue
+            direction = self.evaluation_direction(evaluation)
+            indicators[f"{timeframe}_direction"] = self.direction_value("long" if direction == "bullish" else "short" if direction == "bearish" else "neutral")
+            indicators[f"{timeframe}_{expected}_direction_confirmed"] = 1.0 if direction == expected else 0.0
+            if direction != expected:
+                mismatches.append(f"{timeframe}={direction}")
+
+        if mismatches:
+            side_label = "bullish" if side == "long" else "bearish"
+            return False, f"4H/1H direction must both be {side_label}; mismatches: {', '.join(mismatches)}.", indicators
+        return True, "higher timeframes aligned.", indicators
+
+    def layered_entry_setup(self, evaluation: TimeframeEvaluation, side: str) -> LayeredEntrySetup:
+        direction_key = "bullish" if side == "long" else "bearish"
+        opposite_key = "bearish" if side == "long" else "bullish"
+        smc_score = self.indicator_decimal(evaluation, f"smc_{direction_key}_score")
+        opposite_smc_score = self.indicator_decimal(evaluation, f"smc_{opposite_key}_score")
+        bos_score = self.indicator_decimal(evaluation, f"{direction_key}_bos")
+        liquidity_score = self.indicator_decimal(evaluation, f"liquidity_sweep_{direction_key}_score")
+        order_flow_score = self.indicator_decimal(evaluation, f"order_flow_{direction_key}_score")
+        avwap_score = self.indicator_decimal(evaluation, f"anchored_vwap_{direction_key}_score")
+        profile_score = self.indicator_decimal(evaluation, f"volume_profile_{direction_key}_score")
+        value_area_score = max(avwap_score, profile_score)
+
+        bos_ok = bos_score >= Decimal("1") or not self.config.layered_entry_require_bos
+        smc_score_ok = smc_score >= self.config.layered_entry_smc_min_score
+        smc_direction_ok = smc_score >= opposite_smc_score
+        smc_ok = smc_score_ok and smc_direction_ok and bos_ok
+        liquidity_ok = liquidity_score >= Decimal("1") if self.config.layered_require_liquidity_sweep else True
+        order_flow_ok = order_flow_score >= self.config.layered_entry_order_flow_min_score
+        value_ok = value_area_score >= self.config.layered_entry_position_min_score
+        optional_bonus = (
+            (liquidity_score * Decimal("0.08"))
+            + (order_flow_score * Decimal("0.08"))
+            + (value_area_score * Decimal("0.08"))
+        )
+        conflict_penalty = opposite_smc_score * Decimal("0.15")
+        confidence = self.clamp(
+            smc_score
+            + optional_bonus
+            - conflict_penalty
+        )
+        score_ok = confidence >= self.config.combined_min_score
+
+        blockers = [
+            "SMC below main setup threshold" if not smc_score_ok else "",
+            "opposite SMC score is stronger" if not smc_direction_ok else "",
+            "SMC BOS missing" if not bos_ok else "",
+            "required liquidity sweep missing" if not liquidity_ok else "",
+            f"confidence below COMBINED_MIN_SCORE {self.format_percent(self.config.combined_min_score)}" if not score_ok else "",
+        ]
+        confirmations = [
+            "liquidity sweep" if liquidity_score > Decimal("0") else "",
+            "order flow" if order_flow_ok else "",
+            "VWAP/volume profile" if value_ok else "",
+        ]
+        confirmation_text = ", ".join(item for item in confirmations if item) or "SMC-only"
+        reason = (
+            f"SMC={self.format_percent(smc_score)}, liquidity={self.format_percent(liquidity_score)}, "
+            f"order_flow={self.format_percent(order_flow_score)}, value_area={self.format_percent(value_area_score)}, "
+            f"optional_confirmations={confirmation_text}, layered_confidence={self.format_percent(confidence)}."
+        )
+        blocker_text = "; ".join(item for item in blockers if item)
+        if blocker_text:
+            reason = f"{reason} Blockers: {blocker_text}."
+
+        indicators = {
+            f"layered_{direction_key}_smc_score": float(smc_score),
+            f"layered_{direction_key}_bos": float(bos_score),
+            f"layered_{direction_key}_liquidity_score": float(liquidity_score),
+            f"layered_{direction_key}_order_flow_score": float(order_flow_score),
+            f"layered_{direction_key}_value_area_score": float(value_area_score),
+            "layered_entry_smc_ok": 1.0 if smc_ok else 0.0,
+            "layered_entry_bos_ok": 1.0 if bos_ok else 0.0,
+            "layered_entry_liquidity_ok": 1.0 if liquidity_ok else 0.0,
+            "layered_entry_order_flow_ok": 1.0 if order_flow_ok else 0.0,
+            "layered_entry_value_area_ok": 1.0 if value_ok else 0.0,
+            "layered_entry_score_ok": 1.0 if score_ok else 0.0,
+            "layered_optional_confirmation_count": float(sum(1 for item in confirmations if item)),
+            "layered_optional_bonus": float(optional_bonus),
+            "layered_conflict_penalty": float(conflict_penalty),
+            "layered_entry_confidence": float(confidence),
+        }
+        return LayeredEntrySetup(smc_ok and liquidity_ok and score_ok, confidence, reason, indicators)
 
     def evaluate_timeframe(self, candles: list[Candle]) -> TimeframeEvaluation:
         current_price = candles[-1].close if candles else Decimal("0")
@@ -535,6 +761,34 @@ class CombinedMarketStructureStrategy:
             f"Entry confidence={self.format_percent(confidence)}, edge={self.format_percent(edge)}."
         )
 
+    def evaluation_direction(self, evaluation: TimeframeEvaluation) -> str:
+        bullish_smc = self.indicator_decimal(evaluation, "smc_bullish_score")
+        bearish_smc = self.indicator_decimal(evaluation, "smc_bearish_score")
+        if evaluation.bullish_score > evaluation.bearish_score and bullish_smc >= bearish_smc:
+            return "bullish"
+        if evaluation.bearish_score > evaluation.bullish_score and bearish_smc >= bullish_smc:
+            return "bearish"
+        return "neutral"
+
+    def indicator_decimal(self, evaluation: TimeframeEvaluation, key: str) -> Decimal:
+        return Decimal(str(evaluation.indicators.get(key, 0)))
+
+    def average_true_range(self, candles: list[Candle], period: int) -> Decimal:
+        if len(candles) < period + 1:
+            return Decimal("0")
+        ranges: list[Decimal] = []
+        window = candles[-period:]
+        previous_close = candles[-period - 1].close
+        for candle in window:
+            true_range = max(
+                candle.high - candle.low,
+                abs(candle.high - previous_close),
+                abs(candle.low - previous_close),
+            )
+            ranges.append(true_range)
+            previous_close = candle.close
+        return self.average(ranges)
+
     @staticmethod
     def prefix_indicators(timeframe: str, indicators: dict[str, float]) -> dict[str, float]:
         safe_timeframe = timeframe.replace("/", "_").replace(":", "_")
@@ -542,6 +796,14 @@ class CombinedMarketStructureStrategy:
             f"{safe_timeframe}_{key}": value
             for key, value in indicators.items()
         }
+
+    @staticmethod
+    def direction_value(direction: str) -> float:
+        if direction in {"long", "bullish"}:
+            return 1.0
+        if direction in {"short", "bearish"}:
+            return -1.0
+        return 0.0
 
     @staticmethod
     def average(values: list[Decimal]) -> Decimal:

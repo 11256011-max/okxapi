@@ -321,7 +321,7 @@ class BacktestRunner:
         )
 
     def apply_signal_confidence_gate(self, symbol: str, signal: Signal) -> Signal:
-        threshold = self.config.confidence_threshold_for_symbol(symbol)
+        threshold = self.config.confidence_threshold_for_symbol_and_action(symbol, signal.action)
         if signal.action in {"buy", "sell"} and signal.confidence < threshold:
             return Signal("hold", signal.reason, signal.price, signal.indicators, signal.confidence)
         return signal
