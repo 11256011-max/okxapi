@@ -44,11 +44,14 @@ class TradingBot:
                 logging.warning("Skipping %s because candle fetch failed: %s", symbol, exc)
                 continue
 
+            entry_candles = candles_by_timeframe[self.config.entry_timeframe]
+            if self.manage_open_position(symbol, entry_candles):
+                continue
+
             signal = self.strategy.generate_multi(candles_by_timeframe)
             signal = self.apply_external_context_filter(symbol, signal)
             signal = self.apply_signal_confidence_gate(symbol, signal)
             signal = self.apply_position_risk(symbol, signal)
-            entry_candles = candles_by_timeframe[self.config.entry_timeframe]
 
             logging.info(
                 "Symbol=%s Signal=%s confidence=%s price=%s reason=%s indicators=%s",
@@ -92,7 +95,117 @@ class TradingBot:
             raise RuntimeError("No candles returned by exchange.")
         return candles
 
+    def manage_open_position(self, symbol: str, candles: list[Candle]) -> bool:
+        if not candles or not self.config.dynamic_exit_enabled:
+            return False
+        position = self.state.ensure_symbol(symbol)
+        if position.position_base <= 0 or position.side not in {"long", "short"}:
+            return False
+
+        latest = candles[-1]
+        self.ensure_position_exit_state(symbol, latest.close)
+        if position.risk_per_unit <= 0 or position.stop_loss_price <= 0:
+            logging.warning("Dynamic exit skipped for %s because stop/risk state is unavailable.", symbol)
+            return False
+
+        self.update_position_extremes(position, latest)
+        if self.position_stop_hit(position, latest):
+            close_price = position.stop_loss_price
+            reason = "dynamic stop loss"
+            if position.partial_taken:
+                reason = "dynamic trailing stop"
+            elif position.breakeven_armed:
+                reason = "dynamic breakeven stop"
+            return self.close_swap_position_fraction(symbol, close_price, Decimal("1"), reason)
+
+        if self.position_reached_r(position, latest, self.config.exit_breakeven_r):
+            self.arm_breakeven_stop(symbol, position)
+
+        position_changed = False
+        if not position.partial_taken and self.position_reached_r(position, latest, self.config.exit_partial_take_profit_r):
+            partial_price = self.price_at_r(position.side, position.entry_price, position.risk_per_unit, self.config.exit_partial_take_profit_r)
+            if self.close_swap_position_fraction(symbol, partial_price, self.config.exit_partial_fraction, "dynamic partial take profit"):
+                position.partial_taken = True
+                self.arm_breakeven_stop(symbol, position)
+                logging.info(
+                    "Dynamic partial take profit completed for %s %s at %s; remaining contracts=%s.",
+                    symbol,
+                    position.side,
+                    partial_price,
+                    position.position_base,
+                )
+                position_changed = True
+
+        self.update_trailing_stop(symbol, position, candles)
+        if self.position_stop_hit(position, latest):
+            return self.close_swap_position_fraction(symbol, position.stop_loss_price, Decimal("1"), "dynamic trailing stop")
+        return position_changed
+
+    def ensure_position_exit_state(self, symbol: str, current_price: Decimal) -> None:
+        position = self.state.ensure_symbol(symbol)
+        if position.entry_price <= 0 or position.side not in {"long", "short"}:
+            return
+        if position.highest_price <= 0:
+            position.highest_price = max(position.entry_price, current_price)
+        if position.lowest_price <= 0:
+            position.lowest_price = min(position.entry_price, current_price)
+        if position.stop_loss_price <= 0:
+            _, stop_loss_price = self.exit_prices(position.entry_price, position.side, symbol)
+            position.stop_loss_price = stop_loss_price
+            position.initial_stop_loss_price = stop_loss_price
+        if position.risk_per_unit <= 0:
+            position.risk_per_unit = abs(position.entry_price - position.stop_loss_price)
+
+    @staticmethod
+    def update_position_extremes(position: Any, candle: Candle) -> None:
+        position.highest_price = max(position.highest_price, candle.high)
+        position.lowest_price = min(position.lowest_price, candle.low) if position.lowest_price > 0 else candle.low
+
+    @staticmethod
+    def position_stop_hit(position: Any, candle: Candle) -> bool:
+        if position.stop_loss_price <= 0:
+            return False
+        if position.side == "short":
+            return candle.high >= position.stop_loss_price
+        return candle.low <= position.stop_loss_price
+
+    def position_reached_r(self, position: Any, candle: Candle, reward_risk: Decimal) -> bool:
+        target = self.price_at_r(position.side, position.entry_price, position.risk_per_unit, reward_risk)
+        if position.side == "short":
+            return candle.low <= target
+        return candle.high >= target
+
+    def arm_breakeven_stop(self, symbol: str, position: Any) -> None:
+        if position.side == "short":
+            new_stop = min(position.stop_loss_price, position.entry_price)
+        else:
+            new_stop = max(position.stop_loss_price, position.entry_price)
+        if new_stop != position.stop_loss_price or not position.breakeven_armed:
+            logging.info("Dynamic exit moved %s %s stop to breakeven at %s.", symbol, position.side, new_stop)
+        position.stop_loss_price = new_stop
+        position.breakeven_armed = True
+
+    def update_trailing_stop(self, symbol: str, position: Any, candles: list[Candle]) -> None:
+        if not self.config.exit_trailing_enabled or not position.partial_taken:
+            return
+        atr = self.average_true_range(candles[-(self.config.dynamic_exit_atr_period + 1) :])
+        if atr <= 0:
+            return
+        trailing_distance = atr * self.config.exit_trailing_atr_multiplier
+        if position.side == "short":
+            candidate = position.lowest_price + trailing_distance
+            if candidate < position.stop_loss_price:
+                logging.info("Dynamic trailing stop moved %s short stop from %s to %s.", symbol, position.stop_loss_price, candidate)
+                position.stop_loss_price = candidate
+            return
+        candidate = position.highest_price - trailing_distance
+        if candidate > position.stop_loss_price:
+            logging.info("Dynamic trailing stop moved %s long stop from %s to %s.", symbol, position.stop_loss_price, candidate)
+            position.stop_loss_price = candidate
+
     def apply_position_risk(self, symbol: str, signal: Signal) -> Signal:
+        if self.config.dynamic_exit_enabled:
+            return signal
         if self.config.attach_tp_sl and not self.config.dry_run:
             return signal
         if self.risk.stop_loss_hit(self.state, symbol, signal.price):
@@ -352,19 +465,21 @@ class TradingBot:
                 mode="dry-run",
                 symbol=symbol,
                 position_side=position_side,
+                stop_loss_price=exit_plan.stop_loss_price,
             )
             return
 
         self.assert_order_submission_allowed()
         try:
             self.set_swap_leverage(symbol, plan.leverage, position_side)
+            attached_take_profit = None if self.config.dynamic_exit_enabled else exit_plan.take_profit_price
             order = self.create_swap_market_order_with_tp_sl(
                 symbol,
                 plan.amount_contracts,
                 signal.price,
                 order_side=order_side,
                 position_side=position_side,
-                take_profit_price=exit_plan.take_profit_price,
+                take_profit_price=attached_take_profit,
                 stop_loss_price=exit_plan.stop_loss_price,
             )
         except Exception as exc:
@@ -382,25 +497,36 @@ class TradingBot:
             order_id=order_id,
             symbol=symbol,
             position_side=position_side,
+            stop_loss_price=exit_plan.stop_loss_price,
         )
-        logging.info("Swap %s %s submitted with attached TP/SL: %s", action_label, position_side, order)
+        exit_mode = "attached SL and dynamic exit management" if self.config.dynamic_exit_enabled else "attached TP/SL"
+        logging.info("Swap %s %s submitted with %s: %s", action_label, position_side, exit_mode, order)
 
     def close_swap_position(self, symbol: str, signal: Signal, order_side: str) -> None:
+        self.close_swap_position_fraction(symbol, signal.price, self.config.sell_fraction, f"{signal.reason} close")
+
+    def close_swap_position_fraction(self, symbol: str, price: Decimal, fraction: Decimal, reason: str) -> bool:
         position_side = self.state.get_position_side(symbol)
+        if position_side not in {"long", "short"}:
+            logging.info("Swap close skipped because no local %s position is recorded.", symbol)
+            return False
+        order_side = "buy" if position_side == "short" else "sell"
         amount_contracts = self.state.get_position_base(symbol)
-        amount_contracts = self.quantize_amount(amount_contracts * self.config.sell_fraction)
+        amount_contracts = self.quantize_amount(amount_contracts * fraction)
+        if amount_contracts >= self.state.get_position_base(symbol):
+            amount_contracts = self.state.get_position_base(symbol)
         if amount_contracts <= 0:
             logging.info("Swap close skipped because no local %s position is recorded.", symbol)
-            return
+            return False
 
         if self.config.dry_run:
-            quote_notional = self.contract_notional(symbol, amount_contracts, signal.price)
-            realized_pnl = self.calculate_swap_pnl(symbol, amount_contracts, signal.price)
-            logging.info("[DRY RUN] Would close %s %s contracts=%s realized_pnl=%s.", symbol, position_side, amount_contracts, realized_pnl)
+            quote_notional = self.contract_notional(symbol, amount_contracts, price)
+            realized_pnl = self.calculate_swap_pnl(symbol, amount_contracts, price)
+            logging.info("[DRY RUN] Would close %s %s contracts=%s price=%s realized_pnl=%s reason=%s.", symbol, position_side, amount_contracts, price, realized_pnl, reason)
             self.state.record_trade(
                 order_side,
                 amount_contracts,
-                signal.price,
+                price,
                 quote_notional,
                 mode="dry-run",
                 symbol=symbol,
@@ -408,7 +534,7 @@ class TradingBot:
                 reduce_only=True,
                 realized_pnl=realized_pnl,
             )
-            return
+            return True
 
         self.assert_order_submission_allowed()
         try:
@@ -422,10 +548,10 @@ class TradingBot:
             )
         except Exception as exc:
             logging.warning("Swap close failed due to order execution error: %s", exc)
-            return
+            return False
 
-        average_price = self.decimal_from_order(order, "average", signal.price)
-        close_price = average_price or signal.price
+        average_price = self.decimal_from_order(order, "average", price)
+        close_price = average_price or price
         quote_notional = self.contract_notional(symbol, amount_contracts, close_price)
         realized_pnl = self.calculate_swap_pnl(symbol, amount_contracts, close_price)
         order_id = str(order.get("id")) if isinstance(order, dict) else None
@@ -441,7 +567,8 @@ class TradingBot:
             reduce_only=True,
             realized_pnl=realized_pnl,
         )
-        logging.info("Swap %s close submitted: %s", position_side, order)
+        logging.info("Swap %s close submitted for %s: %s", position_side, reason, order)
+        return True
 
     def build_swap_position_plan(
         self,
@@ -516,20 +643,22 @@ class TradingBot:
         take_profit_price: Decimal | None = None,
         stop_loss_price: Decimal | None = None,
     ) -> dict[str, Any]:
-        if take_profit_price is None or stop_loss_price is None:
+        if take_profit_price is None and stop_loss_price is None:
             take_profit_price, stop_loss_price = self.exit_prices(entry_price, position_side, symbol)
         params = self.swap_order_params(position_side)
         if self.config.attach_tp_sl:
-            params["takeProfit"] = {
-                "triggerPrice": float(take_profit_price),
-                "type": "market",
-                "triggerPriceType": "last",
-            }
-            params["stopLoss"] = {
-                "triggerPrice": float(stop_loss_price),
-                "type": "market",
-                "triggerPriceType": "last",
-            }
+            if take_profit_price is not None:
+                params["takeProfit"] = {
+                    "triggerPrice": float(take_profit_price),
+                    "type": "market",
+                    "triggerPriceType": "last",
+                }
+            if stop_loss_price is not None:
+                params["stopLoss"] = {
+                    "triggerPrice": float(stop_loss_price),
+                    "type": "market",
+                    "triggerPriceType": "last",
+                }
 
         return self.exchange.create_order(
             symbol,
@@ -700,6 +829,29 @@ class TradingBot:
         take_profit_price = entry_price * (Decimal("1") + take_profit_pct)
         stop_loss_price = entry_price * (Decimal("1") - stop_loss_pct)
         return take_profit_price, stop_loss_price
+
+    @staticmethod
+    def price_at_r(position_side: str, entry_price: Decimal, risk_per_unit: Decimal, reward_risk: Decimal) -> Decimal:
+        if position_side == "short":
+            return entry_price - (risk_per_unit * reward_risk)
+        return entry_price + (risk_per_unit * reward_risk)
+
+    @staticmethod
+    def average_true_range(candles: list[Candle]) -> Decimal:
+        if len(candles) < 2:
+            return Decimal("0")
+        ranges: list[Decimal] = []
+        previous_close = candles[0].close
+        for candle in candles[1:]:
+            ranges.append(max(
+                candle.high - candle.low,
+                abs(candle.high - previous_close),
+                abs(candle.low - previous_close),
+            ))
+            previous_close = candle.close
+        if not ranges:
+            return Decimal("0")
+        return sum(ranges, Decimal("0")) / Decimal(len(ranges))
 
     def print_balance(self) -> None:
         self.config.validate(require_private=True)

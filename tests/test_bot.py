@@ -418,6 +418,22 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertEqual(order["params"]["takeProfit"]["triggerPrice"], 106.0)
         self.assertEqual(order["params"]["stopLoss"]["triggerPrice"], 98.5)
 
+    def test_swap_order_can_attach_only_stop_loss_for_dynamic_exit(self) -> None:
+        bot = make_bot({"DRY_RUN": "false", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"})
+
+        order = bot.create_swap_market_order_with_tp_sl(
+            "BTC/USDT:USDT",
+            Decimal("2"),
+            Decimal("100"),
+            order_side="buy",
+            position_side="long",
+            take_profit_price=None,
+            stop_loss_price=Decimal("98"),
+        )
+
+        self.assertNotIn("takeProfit", order["params"])
+        self.assertEqual(order["params"]["stopLoss"]["triggerPrice"], 98.0)
+
     def test_position_mode_uses_detected_okx_net_mode(self) -> None:
         bot = make_bot(
             {"DRY_RUN": "false", "POSITION_MODE": "hedge", "OKX_API_KEY": "key", "OKX_SECRET_KEY": "secret", "OKX_PASSPHRASE": "pass"},
@@ -499,6 +515,48 @@ class BotSwapRiskTests(unittest.TestCase):
 
         self.assertEqual(bot.state.get_add_count(symbol), 0)
         self.assertEqual(bot.state.get_position_base(symbol), Decimal("2"))
+
+    def test_dynamic_exit_takes_partial_profit_at_three_r(self) -> None:
+        bot = make_bot({"EXIT_PARTIAL_FRACTION": "0.5"})
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade(
+            "buy",
+            Decimal("2"),
+            Decimal("100"),
+            Decimal("200"),
+            "dry-run",
+            symbol=symbol,
+            position_side="long",
+            stop_loss_price=Decimal("98"),
+        )
+
+        changed = bot.manage_open_position(symbol, [candle(1, "100", "106.5", "104", "105")])
+
+        self.assertTrue(changed)
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("1.00000000"))
+        position = bot.state.ensure_symbol(symbol)
+        self.assertTrue(position.partial_taken)
+        self.assertTrue(position.breakeven_armed)
+        self.assertEqual(position.stop_loss_price, Decimal("100"))
+
+    def test_dynamic_exit_closes_at_breakeven_after_two_r_reversal(self) -> None:
+        bot = make_bot()
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade(
+            "buy",
+            Decimal("2"),
+            Decimal("100"),
+            Decimal("200"),
+            "dry-run",
+            symbol=symbol,
+            position_side="long",
+            stop_loss_price=Decimal("98"),
+        )
+
+        changed = bot.manage_open_position(symbol, [candle(1, "100", "104.5", "99.5", "100")])
+
+        self.assertTrue(changed)
+        self.assertIsNone(bot.state.get_position_side(symbol))
 
 
 if __name__ == "__main__":

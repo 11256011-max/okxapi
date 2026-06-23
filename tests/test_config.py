@@ -93,6 +93,27 @@ class ConfigTests(unittest.TestCase):
             config.validate()
             self.assertEqual(config.external_context_cache_seconds, 300)
 
+    def test_layered_pullback_and_exit_settings_are_loaded(self) -> None:
+        env = {
+            "SYMBOLS": "ETH/USDT,SOL/USDT",
+            "LAYERED_ENTRY_REQUIRE_PULLBACK": "true",
+            "LAYERED_ENTRY_PULLBACK_TOLERANCE_PCT": "0.003",
+            "LAYERED_ENTRY_MAX_CHASE_PCT": "0.006",
+            "EXIT_BREAKEVEN_R": "2",
+            "EXIT_PARTIAL_TAKE_PROFIT_R": "3",
+            "EXIT_PARTIAL_FRACTION": "0.5",
+            "BACKTEST_START_EQUITY": "1000",
+        }
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
+            config = BotConfig.from_env()
+            config.validate()
+            self.assertEqual(config.symbols, ["ETH/USDT:USDT", "SOL/USDT:USDT"])
+            self.assertTrue(config.layered_entry_require_pullback)
+            self.assertEqual(str(config.exit_breakeven_r), "2")
+            self.assertEqual(str(config.exit_partial_take_profit_r), "3")
+            self.assertEqual(str(config.exit_partial_fraction), "0.5")
+            self.assertEqual(str(config.backtest_start_equity), "1000")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -181,6 +181,10 @@ class StrategyTests(unittest.TestCase):
                 "smc_bullish_score": 0.80,
                 "smc_bearish_score": 0.10,
                 "bullish_bos": 1.0,
+                "current_high": 101.0,
+                "current_low": 99.5,
+                "bullish_order_block_bottom": 99.0,
+                "bullish_order_block_top": 100.5,
                 "liquidity_sweep_bullish_score": 1.0,
                 "order_flow_bullish_score": 0.60,
                 "anchored_vwap_bullish_score": 0.70,
@@ -270,6 +274,10 @@ class StrategyTests(unittest.TestCase):
                 "smc_bullish_score": 0.72,
                 "smc_bearish_score": 0.00,
                 "bullish_bos": 1.0,
+                "current_high": 100.5,
+                "current_low": 99.7,
+                "bullish_order_block_bottom": 99.0,
+                "bullish_order_block_top": 100.2,
                 "liquidity_sweep_bullish_score": 0.0,
                 "order_flow_bullish_score": 0.0,
                 "anchored_vwap_bullish_score": 0.0,
@@ -309,6 +317,61 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.action, "buy")
         self.assertEqual(signal.indicators["layered_optional_confirmation_count"], 0.0)
         self.assertIn("SMC-only", signal.reason)
+
+    def test_layered_smc_blocks_chasing_far_from_pullback_zone(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config({"LAYERED_SMC_ENABLED": "true"}))
+        entry = TimeframeEvaluation(
+            Decimal("110"),
+            Decimal("0.85"),
+            Decimal("0.10"),
+            Decimal("0.75"),
+            {
+                "smc_bullish_score": 0.85,
+                "smc_bearish_score": 0.00,
+                "bullish_bos": 1.0,
+                "current_high": 111.0,
+                "current_low": 109.5,
+                "bullish_order_block_bottom": 99.0,
+                "bullish_order_block_top": 100.0,
+                "anchored_vwap_from_low": 100.0,
+                "liquidity_sweep_bullish_score": 0.0,
+                "order_flow_bullish_score": 0.0,
+                "volume_profile_bullish_score": 0.0,
+            },
+        )
+        confirmation = TimeframeEvaluation(
+            Decimal("110"),
+            Decimal("0.60"),
+            Decimal("0.20"),
+            Decimal("0.40"),
+            {"smc_bullish_score": 0.60, "smc_bearish_score": 0.10},
+        )
+        tradable_market = MarketState(
+            direction="long",
+            trend_clear=True,
+            low_volatility=False,
+            ranging=False,
+            atr_pct=Decimal("0.01"),
+            ma_slope_pct=Decimal("0.01"),
+            range_pct=Decimal("0.04"),
+            current_ma=Decimal("101"),
+            previous_ma=Decimal("100"),
+        )
+
+        with patch.object(strategy, "evaluate_timeframe", side_effect=[entry, confirmation, confirmation]), patch.object(
+            strategy,
+            "market_state",
+            return_value=tradable_market,
+        ):
+            signal = strategy.generate_multi({
+                "30m": range_candles(),
+                "1h": range_candles(),
+                "4h": range_candles(),
+            })
+
+        self.assertEqual(signal.action, "hold")
+        self.assertEqual(signal.indicators["layered_entry_pullback_ok"], 0.0)
+        self.assertIn("price has not pulled back", signal.reason)
 
 
 if __name__ == "__main__":

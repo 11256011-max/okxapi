@@ -18,6 +18,13 @@ class SymbolPosition:
     entry_price: Decimal = Decimal("0")
     side: str | None = None
     add_count: int = 0
+    initial_stop_loss_price: Decimal = Decimal("0")
+    stop_loss_price: Decimal = Decimal("0")
+    risk_per_unit: Decimal = Decimal("0")
+    highest_price: Decimal = Decimal("0")
+    lowest_price: Decimal = Decimal("0")
+    breakeven_armed: bool = False
+    partial_taken: bool = False
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any] | None) -> "SymbolPosition":
@@ -27,14 +34,28 @@ class SymbolPosition:
             entry_price=Decimal(str(raw.get("entry_price", "0"))),
             side=raw.get("side") or ("long" if Decimal(str(raw.get("position_base", "0"))) > 0 else None),
             add_count=int(raw.get("add_count", 0) or 0),
+            initial_stop_loss_price=Decimal(str(raw.get("initial_stop_loss_price", "0"))),
+            stop_loss_price=Decimal(str(raw.get("stop_loss_price", "0"))),
+            risk_per_unit=Decimal(str(raw.get("risk_per_unit", "0"))),
+            highest_price=Decimal(str(raw.get("highest_price", "0"))),
+            lowest_price=Decimal(str(raw.get("lowest_price", "0"))),
+            breakeven_armed=bool(raw.get("breakeven_armed", False)),
+            partial_taken=bool(raw.get("partial_taken", False)),
         )
 
-    def to_json(self) -> dict[str, str | None]:
+    def to_json(self) -> dict[str, str | bool | None]:
         return {
             "position_base": str(self.position_base),
             "entry_price": str(self.entry_price),
             "side": self.side,
             "add_count": str(self.add_count),
+            "initial_stop_loss_price": str(self.initial_stop_loss_price),
+            "stop_loss_price": str(self.stop_loss_price),
+            "risk_per_unit": str(self.risk_per_unit),
+            "highest_price": str(self.highest_price),
+            "lowest_price": str(self.lowest_price),
+            "breakeven_armed": self.breakeven_armed,
+            "partial_taken": self.partial_taken,
         }
 
 
@@ -143,6 +164,7 @@ class BotState:
         position_side: str | None = None,
         reduce_only: bool = False,
         realized_pnl: Decimal = Decimal("0"),
+        stop_loss_price: Decimal = Decimal("0"),
     ) -> None:
         symbol = symbol or self.default_symbol
         position = self.ensure_symbol(symbol)
@@ -161,12 +183,13 @@ class BotState:
                 "position_side": position_side,
                 "reduce_only": reduce_only,
                 "realized_pnl": str(realized_pnl),
+                "stop_loss_price": str(stop_loss_price),
             }
         )
         self.daily_realized_pnl += realized_pnl
 
         if position_side in {"long", "short"} and not reduce_only:
-            self.open_position(position, position_side, amount_base, price)
+            self.open_position(position, position_side, amount_base, price, stop_loss_price)
             return
 
         if reduce_only:
@@ -194,6 +217,7 @@ class BotState:
         side: str,
         amount_base: Decimal,
         price: Decimal,
+        stop_loss_price: Decimal = Decimal("0"),
     ) -> None:
         is_add = position.position_base > 0 and position.side == side
         new_total_base = position.position_base + amount_base
@@ -204,6 +228,23 @@ class BotState:
         position.position_base = new_total_base
         position.side = side
         position.add_count = position.add_count + 1 if is_add else 0
+        if stop_loss_price > 0:
+            if not is_add or position.stop_loss_price <= 0:
+                position.stop_loss_price = stop_loss_price
+            elif side == "long":
+                position.stop_loss_price = max(position.stop_loss_price, stop_loss_price)
+            else:
+                position.stop_loss_price = min(position.stop_loss_price, stop_loss_price)
+            position.initial_stop_loss_price = position.stop_loss_price
+            position.risk_per_unit = abs(position.entry_price - position.stop_loss_price)
+        if not is_add:
+            position.highest_price = price
+            position.lowest_price = price
+            position.breakeven_armed = False
+            position.partial_taken = False
+        else:
+            position.highest_price = max(position.highest_price, price)
+            position.lowest_price = min(position.lowest_price, price) if position.lowest_price > 0 else price
 
     def clear_symbol_position(self, symbol: str | None = None) -> None:
         position = self.ensure_symbol(symbol)
@@ -211,3 +252,10 @@ class BotState:
         position.entry_price = Decimal("0")
         position.side = None
         position.add_count = 0
+        position.initial_stop_loss_price = Decimal("0")
+        position.stop_loss_price = Decimal("0")
+        position.risk_per_unit = Decimal("0")
+        position.highest_price = Decimal("0")
+        position.lowest_price = Decimal("0")
+        position.breakeven_armed = False
+        position.partial_taken = False

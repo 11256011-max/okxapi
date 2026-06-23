@@ -135,6 +135,9 @@ class BotConfig:
     layered_market_max_range_pct: Decimal
     layered_entry_smc_min_score: Decimal
     layered_entry_require_bos: bool
+    layered_entry_require_pullback: bool
+    layered_entry_pullback_tolerance_pct: Decimal
+    layered_entry_max_chase_pct: Decimal
     layered_entry_order_flow_min_score: Decimal
     layered_entry_position_min_score: Decimal
     layered_require_liquidity_sweep: bool
@@ -204,6 +207,12 @@ class BotConfig:
     dynamic_exit_strong_rr: Decimal
     dynamic_exit_strong_confidence: Decimal
     dynamic_exit_trend_ma_period: int
+    exit_breakeven_r: Decimal
+    exit_partial_take_profit_r: Decimal
+    exit_partial_fraction: Decimal
+    exit_trailing_atr_multiplier: Decimal
+    exit_trailing_enabled: bool
+    backtest_start_equity: Decimal
     backtest_fee_pct: Decimal
     backtest_slippage_pct: Decimal
     backtest_funding_rate_8h: Decimal
@@ -249,6 +258,9 @@ class BotConfig:
             layered_market_max_range_pct=env_probability("LAYERED_MARKET_MAX_RANGE_PCT", "0.030"),
             layered_entry_smc_min_score=env_probability("LAYERED_ENTRY_SMC_MIN_SCORE", "0.50"),
             layered_entry_require_bos=env_bool("LAYERED_ENTRY_REQUIRE_BOS", True),
+            layered_entry_require_pullback=env_bool("LAYERED_ENTRY_REQUIRE_PULLBACK", True),
+            layered_entry_pullback_tolerance_pct=env_probability("LAYERED_ENTRY_PULLBACK_TOLERANCE_PCT", "0.003"),
+            layered_entry_max_chase_pct=env_probability("LAYERED_ENTRY_MAX_CHASE_PCT", "0.006"),
             layered_entry_order_flow_min_score=env_probability("LAYERED_ENTRY_ORDER_FLOW_MIN_SCORE", "0.20"),
             layered_entry_position_min_score=env_probability("LAYERED_ENTRY_POSITION_MIN_SCORE", "0.50"),
             layered_require_liquidity_sweep=env_bool("LAYERED_REQUIRE_LIQUIDITY_SWEEP", False),
@@ -308,7 +320,7 @@ class BotConfig:
             attach_tp_sl=env_bool("ATTACH_TP_SL", True),
             sell_fraction=env_decimal("SELL_FRACTION", "1"),
             dynamic_exit_enabled=env_bool("DYNAMIC_EXIT_ENABLED", True),
-            dynamic_exit_symbols=env_list("DYNAMIC_EXIT_SYMBOLS", "ETH"),
+            dynamic_exit_symbols=env_list("DYNAMIC_EXIT_SYMBOLS", "ETH,SOL"),
             dynamic_exit_atr_period=env_int("DYNAMIC_EXIT_ATR_PERIOD", 14),
             dynamic_exit_structure_lookback=env_int("DYNAMIC_EXIT_STRUCTURE_LOOKBACK", 20),
             dynamic_exit_min_stop_pct=env_probability("DYNAMIC_EXIT_MIN_STOP_PCT", "0.012"),
@@ -318,6 +330,12 @@ class BotConfig:
             dynamic_exit_strong_rr=env_decimal("DYNAMIC_EXIT_STRONG_RR", "4.0"),
             dynamic_exit_strong_confidence=env_probability("DYNAMIC_EXIT_STRONG_CONFIDENCE", "0.70"),
             dynamic_exit_trend_ma_period=env_int("DYNAMIC_EXIT_TREND_MA_PERIOD", 20),
+            exit_breakeven_r=env_decimal("EXIT_BREAKEVEN_R", "2.0"),
+            exit_partial_take_profit_r=env_decimal("EXIT_PARTIAL_TAKE_PROFIT_R", "3.0"),
+            exit_partial_fraction=env_probability("EXIT_PARTIAL_FRACTION", "0.5"),
+            exit_trailing_atr_multiplier=env_decimal("EXIT_TRAILING_ATR_MULTIPLIER", "1.5"),
+            exit_trailing_enabled=env_bool("EXIT_TRAILING_ENABLED", True),
+            backtest_start_equity=env_decimal("BACKTEST_START_EQUITY", "1000"),
             backtest_fee_pct=env_probability("BACKTEST_FEE_PCT", "0.0005"),
             backtest_slippage_pct=env_probability("BACKTEST_SLIPPAGE_PCT", "0.0005"),
             backtest_funding_rate_8h=env_probability("BACKTEST_FUNDING_RATE_8H", "0.0001"),
@@ -404,6 +422,8 @@ class BotConfig:
             raise ConfigError("Layered SMC market percentage settings cannot be negative.")
         if not Decimal("0") <= self.layered_entry_smc_min_score <= Decimal("1"):
             raise ConfigError("LAYERED_ENTRY_SMC_MIN_SCORE must be between 0 and 1.")
+        if self.layered_entry_pullback_tolerance_pct < 0 or self.layered_entry_max_chase_pct < 0:
+            raise ConfigError("Layered SMC pullback percentage settings cannot be negative.")
         if not Decimal("0") <= self.layered_entry_order_flow_min_score <= Decimal("1"):
             raise ConfigError("LAYERED_ENTRY_ORDER_FLOW_MIN_SCORE must be between 0 and 1.")
         if not Decimal("0") <= self.layered_entry_position_min_score <= Decimal("1"):
@@ -514,6 +534,14 @@ class BotConfig:
             raise ConfigError("DYNAMIC_EXIT_STRONG_RR must be greater than or equal to DYNAMIC_EXIT_BASE_RR.")
         if not Decimal("0") <= self.dynamic_exit_strong_confidence <= Decimal("1"):
             raise ConfigError("DYNAMIC_EXIT_STRONG_CONFIDENCE must be between 0 and 1, or 0 and 100 percent.")
+        if self.exit_breakeven_r <= 0 or self.exit_partial_take_profit_r <= 0 or self.exit_trailing_atr_multiplier <= 0:
+            raise ConfigError("EXIT_BREAKEVEN_R, EXIT_PARTIAL_TAKE_PROFIT_R, and EXIT_TRAILING_ATR_MULTIPLIER must be greater than 0.")
+        if self.exit_partial_take_profit_r < self.exit_breakeven_r:
+            raise ConfigError("EXIT_PARTIAL_TAKE_PROFIT_R must be greater than or equal to EXIT_BREAKEVEN_R.")
+        if not Decimal("0") < self.exit_partial_fraction < Decimal("1"):
+            raise ConfigError("EXIT_PARTIAL_FRACTION must be greater than 0 and less than 1.")
+        if self.backtest_start_equity <= 0:
+            raise ConfigError("BACKTEST_START_EQUITY must be greater than 0.")
         if require_private and not self.has_private_credentials:
             raise ConfigError("Private credentials are required for this command.")
         if require_order_submission:

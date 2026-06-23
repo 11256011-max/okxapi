@@ -320,6 +320,8 @@ class CombinedMarketStructureStrategy:
         avwap_score = self.indicator_decimal(evaluation, f"anchored_vwap_{direction_key}_score")
         profile_score = self.indicator_decimal(evaluation, f"volume_profile_{direction_key}_score")
         value_area_score = max(avwap_score, profile_score)
+        pullback_ok, pullback_reason, pullback_indicators = self.layered_pullback_location(evaluation, side)
+        pullback_filter_ok = pullback_ok or not self.config.layered_entry_require_pullback
 
         bos_ok = bos_score >= Decimal("1") or not self.config.layered_entry_require_bos
         smc_score_ok = smc_score >= self.config.layered_entry_smc_min_score
@@ -345,6 +347,7 @@ class CombinedMarketStructureStrategy:
             "SMC below main setup threshold" if not smc_score_ok else "",
             "opposite SMC score is stronger" if not smc_direction_ok else "",
             "SMC BOS missing" if not bos_ok else "",
+            "price has not pulled back to OB/FVG/VWAP" if not pullback_filter_ok else "",
             "required liquidity sweep missing" if not liquidity_ok else "",
             f"confidence below COMBINED_MIN_SCORE {self.format_percent(self.config.combined_min_score)}" if not score_ok else "",
         ]
@@ -357,7 +360,8 @@ class CombinedMarketStructureStrategy:
         reason = (
             f"SMC={self.format_percent(smc_score)}, liquidity={self.format_percent(liquidity_score)}, "
             f"order_flow={self.format_percent(order_flow_score)}, value_area={self.format_percent(value_area_score)}, "
-            f"optional_confirmations={confirmation_text}, layered_confidence={self.format_percent(confidence)}."
+            f"pullback={pullback_reason}, optional_confirmations={confirmation_text}, "
+            f"layered_confidence={self.format_percent(confidence)}."
         )
         blocker_text = "; ".join(item for item in blockers if item)
         if blocker_text:
@@ -371,6 +375,7 @@ class CombinedMarketStructureStrategy:
             f"layered_{direction_key}_value_area_score": float(value_area_score),
             "layered_entry_smc_ok": 1.0 if smc_ok else 0.0,
             "layered_entry_bos_ok": 1.0 if bos_ok else 0.0,
+            "layered_entry_pullback_ok": 1.0 if pullback_ok else 0.0,
             "layered_entry_liquidity_ok": 1.0 if liquidity_ok else 0.0,
             "layered_entry_order_flow_ok": 1.0 if order_flow_ok else 0.0,
             "layered_entry_value_area_ok": 1.0 if value_ok else 0.0,
@@ -379,8 +384,48 @@ class CombinedMarketStructureStrategy:
             "layered_optional_bonus": float(optional_bonus),
             "layered_conflict_penalty": float(conflict_penalty),
             "layered_entry_confidence": float(confidence),
+            **pullback_indicators,
         }
-        return LayeredEntrySetup(smc_ok and liquidity_ok and score_ok, confidence, reason, indicators)
+        return LayeredEntrySetup(smc_ok and pullback_filter_ok and liquidity_ok and score_ok, confidence, reason, indicators)
+
+    def layered_pullback_location(self, evaluation: TimeframeEvaluation, side: str) -> tuple[bool, str, dict[str, float]]:
+        direction_key = "bullish" if side == "long" else "bearish"
+        price = evaluation.current_price
+        current_high = self.indicator_decimal(evaluation, "current_high") or price
+        current_low = self.indicator_decimal(evaluation, "current_low") or price
+        tolerance = self.config.layered_entry_pullback_tolerance_pct
+        max_chase = self.config.layered_entry_max_chase_pct
+
+        ob_bottom = self.indicator_decimal(evaluation, f"{direction_key}_order_block_bottom")
+        ob_top = self.indicator_decimal(evaluation, f"{direction_key}_order_block_top")
+        fvg_bottom = self.indicator_decimal(evaluation, f"{direction_key}_fvg_bottom")
+        fvg_top = self.indicator_decimal(evaluation, f"{direction_key}_fvg_top")
+        vwap_key = "anchored_vwap_from_low" if side == "long" else "anchored_vwap_from_high"
+        anchored_vwap = self.indicator_decimal(evaluation, vwap_key)
+
+        ob_ok = self.zone_touched(side, price, current_high, current_low, ob_bottom, ob_top, tolerance, max_chase)
+        fvg_ok = self.zone_touched(side, price, current_high, current_low, fvg_bottom, fvg_top, tolerance, max_chase)
+        vwap_ok = self.level_touched(side, price, current_high, current_low, anchored_vwap, tolerance, max_chase)
+        pullback_ok = ob_ok or fvg_ok or vwap_ok
+        chase_distance = Decimal("0") if pullback_ok else self.chase_distance_pct(side, price, ob_bottom, ob_top, fvg_bottom, fvg_top, anchored_vwap)
+        chase_ok = chase_distance <= self.config.layered_entry_max_chase_pct
+
+        labels = [
+            "OB" if ob_ok else "",
+            "FVG" if fvg_ok else "",
+            "VWAP" if vwap_ok else "",
+        ]
+        location = "/".join(label for label in labels if label) or "none"
+        valid = pullback_ok and chase_ok
+        reason = f"{location}, chase_distance={self.format_percent(chase_distance)}"
+        indicators = {
+            "layered_pullback_ob_ok": 1.0 if ob_ok else 0.0,
+            "layered_pullback_fvg_ok": 1.0 if fvg_ok else 0.0,
+            "layered_pullback_vwap_ok": 1.0 if vwap_ok else 0.0,
+            "layered_pullback_chase_ok": 1.0 if chase_ok else 0.0,
+            "layered_pullback_chase_distance_pct": float(chase_distance),
+        }
+        return valid, reason, indicators
 
     def evaluate_timeframe(self, candles: list[Candle]) -> TimeframeEvaluation:
         current_price = candles[-1].close if candles else Decimal("0")
@@ -425,6 +470,8 @@ class CombinedMarketStructureStrategy:
 
         edge = abs(bullish_score - bearish_score)
         indicators = {
+            "current_high": float(latest.high),
+            "current_low": float(latest.low),
             "order_flow_bullish_score": float(order_flow.bullish),
             "order_flow_bearish_score": float(order_flow.bearish),
             "liquidity_sweep_bullish_score": float(liquidity.bullish),
@@ -587,8 +634,10 @@ class CombinedMarketStructureStrategy:
         bearish_bos = previous.close >= last_low > latest.close or latest.close < recent_low
         bullish_displacement = self.has_displacement(latest.close, last_high)
         bearish_displacement = self.has_displacement(last_low, latest.close)
-        bullish_fvg = self.has_recent_fvg(candles, "bullish")
-        bearish_fvg = self.has_recent_fvg(candles, "bearish")
+        bullish_fvg_zone = self.find_fvg(candles, "bullish")
+        bearish_fvg_zone = self.find_fvg(candles, "bearish")
+        bullish_fvg = bullish_fvg_zone is not None
+        bearish_fvg = bearish_fvg_zone is not None
         bullish_order_block = self.find_order_block(candles, "bullish")
         bearish_order_block = self.find_order_block(candles, "bearish")
 
@@ -615,6 +664,10 @@ class CombinedMarketStructureStrategy:
             "bearish_bos": 1.0 if bearish_bos else 0.0,
             "bullish_fvg": 1.0 if bullish_fvg else 0.0,
             "bearish_fvg": 1.0 if bearish_fvg else 0.0,
+            "bullish_fvg_bottom": float(bullish_fvg_zone.bottom) if bullish_fvg_zone else 0.0,
+            "bullish_fvg_top": float(bullish_fvg_zone.top) if bullish_fvg_zone else 0.0,
+            "bearish_fvg_bottom": float(bearish_fvg_zone.bottom) if bearish_fvg_zone else 0.0,
+            "bearish_fvg_top": float(bearish_fvg_zone.top) if bearish_fvg_zone else 0.0,
             "bullish_order_block_bottom": float(bullish_order_block.bottom) if bullish_order_block else 0.0,
             "bullish_order_block_top": float(bullish_order_block.top) if bullish_order_block else 0.0,
             "bearish_order_block_bottom": float(bearish_order_block.bottom) if bearish_order_block else 0.0,
@@ -715,13 +768,16 @@ class CombinedMarketStructureStrategy:
         return None
 
     def has_recent_fvg(self, candles: list[Candle], side: str) -> bool:
+        return self.find_fvg(candles, side) is not None
+
+    def find_fvg(self, candles: list[Candle], side: str) -> PriceZone | None:
         start = max(2, len(candles) - self.config.combined_structure_lookback)
-        for index in range(start, len(candles)):
+        for index in range(len(candles) - 1, start - 1, -1):
             if side == "bullish" and candles[index - 2].high < candles[index].low:
-                return True
+                return PriceZone(bottom=candles[index - 2].high, top=candles[index].low, index=index)
             if side == "bearish" and candles[index - 2].low > candles[index].high:
-                return True
-        return False
+                return PriceZone(bottom=candles[index].high, top=candles[index - 2].low, index=index)
+        return None
 
     def has_displacement(self, higher_price: Decimal, lower_price: Decimal) -> bool:
         if lower_price <= 0:
@@ -788,6 +844,77 @@ class CombinedMarketStructureStrategy:
             ranges.append(true_range)
             previous_close = candle.close
         return self.average(ranges)
+
+    @staticmethod
+    def zone_touched(
+        side: str,
+        price: Decimal,
+        current_high: Decimal,
+        current_low: Decimal,
+        bottom: Decimal,
+        top: Decimal,
+        tolerance: Decimal,
+        max_chase: Decimal,
+    ) -> bool:
+        if price <= 0 or bottom <= 0 or top <= 0:
+            return False
+        lower = min(bottom, top)
+        upper = max(bottom, top)
+        if side == "short":
+            touched = current_high >= lower * (Decimal("1") - tolerance)
+            closed_near_zone = lower * (Decimal("1") - tolerance) <= price <= upper * (Decimal("1") + tolerance)
+            rejected_from_zone = touched and lower * (Decimal("1") - max_chase) <= price <= upper * (Decimal("1") + tolerance)
+            return closed_near_zone or rejected_from_zone
+
+        touched = current_low <= upper * (Decimal("1") + tolerance)
+        closed_near_zone = lower * (Decimal("1") - tolerance) <= price <= upper * (Decimal("1") + tolerance)
+        bounced_from_zone = touched and lower * (Decimal("1") - tolerance) <= price <= upper * (Decimal("1") + max_chase)
+        return closed_near_zone or bounced_from_zone
+
+    @staticmethod
+    def level_touched(
+        side: str,
+        price: Decimal,
+        current_high: Decimal,
+        current_low: Decimal,
+        level: Decimal,
+        tolerance: Decimal,
+        max_chase: Decimal,
+    ) -> bool:
+        if price <= 0 or level <= 0:
+            return False
+        if side == "short":
+            return (
+                current_high >= level * (Decimal("1") - tolerance)
+                and level * (Decimal("1") - max_chase) <= price <= level * (Decimal("1") + tolerance)
+            )
+        return (
+            current_low <= level * (Decimal("1") + tolerance)
+            and level * (Decimal("1") - tolerance) <= price <= level * (Decimal("1") + max_chase)
+        )
+
+    @staticmethod
+    def chase_distance_pct(
+        side: str,
+        price: Decimal,
+        ob_bottom: Decimal,
+        ob_top: Decimal,
+        fvg_bottom: Decimal,
+        fvg_top: Decimal,
+        anchored_vwap: Decimal,
+    ) -> Decimal:
+        if price <= 0:
+            return Decimal("1")
+        if side == "short":
+            levels = [level for level in [ob_bottom, fvg_bottom, anchored_vwap] if level > 0 and level >= price]
+            if not levels:
+                return Decimal("1")
+            return max(Decimal("0"), (min(levels) - price) / price)
+
+        levels = [level for level in [ob_top, fvg_top, anchored_vwap] if level > 0 and level <= price]
+        if not levels:
+            return Decimal("1")
+        return max(Decimal("0"), (price - max(levels)) / price)
 
     @staticmethod
     def prefix_indicators(timeframe: str, indicators: dict[str, float]) -> dict[str, float]:
