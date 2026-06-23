@@ -423,7 +423,8 @@ class TradingBot:
             raise RiskError("Margin budget is zero.")
 
         needed_leverage = self.ceil_decimal(max_notional_by_risk / margin_budget)
-        leverage = max(1, needed_leverage)
+        max_allowed_leverage = self.max_allowed_leverage(symbol)
+        leverage = max(1, min(needed_leverage, max_allowed_leverage))
         notional = min(max_notional_by_risk, margin_budget * Decimal(leverage))
         amount_contracts = self.contract_amount_from_notional(symbol, notional, entry_price)
         if amount_contracts <= 0:
@@ -438,6 +439,16 @@ class TradingBot:
             leverage=leverage,
             amount_contracts=amount_contracts,
         )
+
+    def max_allowed_leverage(self, symbol: str) -> int:
+        self.exchange.load_markets()
+        market = self.exchange.market(symbol)
+        max_leverage = self.decimal_from_path(market, ("limits", "leverage", "max"))
+        if max_leverage is None:
+            max_leverage = self.decimal_from_path(market, ("info", "lever"))
+        if max_leverage is None:
+            return 125
+        return max(1, int(max_leverage))
 
     def create_swap_market_order_with_tp_sl(
         self,
@@ -689,6 +700,17 @@ class TradingBot:
         if isinstance(order, dict) and order.get(key) not in (None, ""):
             return Decimal(str(order[key]))
         return fallback
+
+    @staticmethod
+    def decimal_from_path(source: Any, path: tuple[str, ...]) -> Decimal | None:
+        current = source
+        for key in path:
+            if not isinstance(current, dict):
+                return None
+            current = current.get(key)
+        if current in (None, ""):
+            return None
+        return Decimal(str(current))
 
     @staticmethod
     def quantize_amount(value: Decimal) -> Decimal:

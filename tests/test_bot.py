@@ -12,9 +12,10 @@ from okx_bot.state import BotState
 
 
 class FakeExchange:
-    def __init__(self, equity: str = "10000", hedged: bool = False) -> None:
+    def __init__(self, equity: str = "10000", hedged: bool = False, leverage_max: str = "100") -> None:
         self.equity = equity
         self.hedged = hedged
+        self.leverage_max = leverage_max
         self.orders = []
         self.leverage_calls = []
 
@@ -22,7 +23,12 @@ class FakeExchange:
         return None
 
     def market(self, symbol: str) -> dict[str, str]:
-        return {"id": symbol.replace("/", "-").replace(":", "-"), "contractSize": "1"}
+        return {
+            "id": symbol.replace("/", "-").replace(":", "-"),
+            "contractSize": "1",
+            "limits": {"leverage": {"min": 1, "max": self.leverage_max}},
+            "info": {"lever": self.leverage_max},
+        }
 
     def amount_to_precision(self, symbol: str, amount: float) -> str:
         return f"{amount:.8f}".rstrip("0").rstrip(".")
@@ -131,11 +137,16 @@ def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
         return config
 
 
-def make_bot(extra_env: dict[str, str] | None = None, equity: str = "10000", hedged: bool = False) -> TradingBot:
+def make_bot(
+    extra_env: dict[str, str] | None = None,
+    equity: str = "10000",
+    hedged: bool = False,
+    leverage_max: str = "100",
+) -> TradingBot:
     config = make_config(extra_env)
     bot = object.__new__(TradingBot)
     bot.config = config
-    bot.exchange = FakeExchange(equity, hedged=hedged)
+    bot.exchange = FakeExchange(equity, hedged=hedged, leverage_max=leverage_max)
     bot.external_context = None
     bot.state = BotState(default_symbol=config.symbols[0])
     bot._effective_position_mode = None
@@ -242,16 +253,16 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertEqual(plan.leverage, 5)
         self.assertEqual(plan.amount_contracts, Decimal("50"))
 
-    def test_build_swap_position_plan_does_not_cap_leverage_by_config(self) -> None:
+    def test_build_swap_position_plan_caps_leverage_by_market_limit(self) -> None:
         bot = make_bot({"ORDER_QUOTE_AMOUNT": "10", "MAX_QUOTE_PER_ORDER": "10"})
 
         plan = bot.build_swap_position_plan("BTC/USDT:USDT", Decimal("100"))
 
         self.assertEqual(plan.risk_amount, Decimal("100.00"))
         self.assertEqual(plan.margin_budget, Decimal("10"))
-        self.assertEqual(plan.notional, Decimal("5000"))
-        self.assertEqual(plan.leverage, 500)
-        self.assertEqual(plan.amount_contracts, Decimal("50"))
+        self.assertEqual(plan.notional, Decimal("1000"))
+        self.assertEqual(plan.leverage, 100)
+        self.assertEqual(plan.amount_contracts, Decimal("10"))
 
     def test_short_exit_prices_reverse_take_profit_and_stop_loss(self) -> None:
         bot = make_bot()
