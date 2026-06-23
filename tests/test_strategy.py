@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from okx_bot.config import BotConfig
 from okx_bot.models import Candle
-from okx_bot.strategy import CombinedMarketStructureStrategy, create_strategy
+from okx_bot.strategy import CombinedMarketStructureStrategy, TimeframeEvaluation, create_strategy
 
 
 def candle(index: int, open_: str, high: str, low: str, close: str, volume: str = "10") -> Candle:
@@ -27,8 +27,8 @@ def config(extra_env: dict[str, str] | None = None) -> BotConfig:
         "COMBINED_ORDER_FLOW_LOOKBACK": "20",
         "COMBINED_AVWAP_LOOKBACK": "40",
         "COMBINED_VOLUME_PROFILE_LOOKBACK": "40",
-        "COMBINED_MIN_SCORE": "0.80",
-        "COMBINED_MIN_EDGE": "0.10",
+        "COMBINED_MIN_SCORE": "0.68",
+        "COMBINED_MIN_EDGE": "0.12",
         "ENTRY_TIMEFRAME": "30m",
         "CONFIRMATION_TIMEFRAMES": "1h,4h",
         "EXTERNAL_CONTEXT_ENABLED": "false",
@@ -119,7 +119,7 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.action, "buy")
         self.assertGreaterEqual(signal.confidence, Decimal("0.80"))
         self.assertEqual(signal.indicators["higher_timeframe_bullish_alignment"], 1.0)
-        self.assertIn("Multi-timeframe long", signal.reason)
+        self.assertIn("30m long entry", signal.reason)
 
     def test_multi_timeframe_holds_when_higher_timeframe_disagrees(self) -> None:
         strategy = CombinedMarketStructureStrategy(config())
@@ -136,6 +136,39 @@ class StrategyTests(unittest.TestCase):
 
         self.assertEqual(signal.action, "hold")
         self.assertEqual(signal.indicators["higher_timeframe_bullish_alignment"], 0.0)
+
+    def test_multi_timeframe_uses_entry_score_and_filters_higher_timeframes(self) -> None:
+        strategy = CombinedMarketStructureStrategy(config())
+        entry = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.70"),
+            Decimal("0.55"),
+            Decimal("0.15"),
+            {"bullish_score": 0.70, "bearish_score": 0.55},
+        )
+        weak_bullish_confirmation = TimeframeEvaluation(
+            Decimal("100"),
+            Decimal("0.05"),
+            Decimal("0.04"),
+            Decimal("0.01"),
+            {"bullish_score": 0.05, "bearish_score": 0.04},
+        )
+
+        with patch.object(
+            strategy,
+            "evaluate_timeframe",
+            side_effect=[entry, weak_bullish_confirmation, weak_bullish_confirmation],
+        ):
+            signal = strategy.generate_multi({
+                "30m": range_candles(),
+                "1h": range_candles(),
+                "4h": range_candles(),
+            })
+
+        self.assertEqual(signal.action, "buy")
+        self.assertEqual(signal.confidence, Decimal("0.70"))
+        self.assertEqual(signal.indicators["bullish_score"], 0.70)
+        self.assertEqual(signal.indicators["higher_timeframe_bullish_alignment"], 1.0)
 
 
 if __name__ == "__main__":

@@ -101,17 +101,9 @@ class CombinedMarketStructureStrategy:
             if timeframe in evaluations and timeframe != entry_timeframe
         ]
 
-        entry_weight = Decimal("0.50") if confirmation_timeframes else Decimal("1")
-        confirmation_weight = (Decimal("1") - entry_weight) / Decimal(len(confirmation_timeframes)) if confirmation_timeframes else Decimal("0")
-        bullish_score = entry_evaluation.bullish_score * entry_weight
-        bearish_score = entry_evaluation.bearish_score * entry_weight
-        for timeframe in confirmation_timeframes:
-            bullish_score += evaluations[timeframe].bullish_score * confirmation_weight
-            bearish_score += evaluations[timeframe].bearish_score * confirmation_weight
-
-        bullish_score = self.clamp(bullish_score)
-        bearish_score = self.clamp(bearish_score)
-        edge = abs(bullish_score - bearish_score)
+        bullish_score = entry_evaluation.bullish_score
+        bearish_score = entry_evaluation.bearish_score
+        edge = entry_evaluation.edge
         bullish_aligned = all(
             evaluations[timeframe].bullish_score >= evaluations[timeframe].bearish_score
             for timeframe in confirmation_timeframes
@@ -126,8 +118,7 @@ class CombinedMarketStructureStrategy:
             "bearish_score": float(bearish_score),
             "strategy_edge": float(edge),
             "integrated_strategy_confidence": float(max(bullish_score, bearish_score)),
-            "entry_timeframe_weight": float(entry_weight),
-            "confirmation_timeframe_weight": float(confirmation_weight),
+            "entry_timeframe_filter_mode": 1.0,
             "higher_timeframe_bullish_alignment": 1.0 if bullish_aligned else 0.0,
             "higher_timeframe_bearish_alignment": 1.0 if bearish_aligned else 0.0,
         }
@@ -159,9 +150,9 @@ class CombinedMarketStructureStrategy:
 
         confidence = max(bullish_score, bearish_score)
         reason = (
-            "Multi-timeframe strategy did not reach threshold, directional edge, or higher-timeframe alignment. "
+            f"{entry_timeframe} entry strategy did not reach threshold, directional edge, or higher-timeframe alignment. "
             f"bullish={self.format_percent(bullish_score)}, bearish={self.format_percent(bearish_score)}, "
-            f"edge={self.format_percent(edge)}."
+            f"edge={self.format_percent(edge)}. Higher-timeframe filters={', '.join(confirmation_timeframes) or 'none'}."
         )
         return Signal("hold", reason, entry_evaluation.current_price, {**indicators, "confidence": float(confidence)}, confidence)
 
@@ -540,8 +531,8 @@ class CombinedMarketStructureStrategy:
         suffix = "long" if side == "long" else "short"
         confirmations = ", ".join(confirmation_timeframes) if confirmation_timeframes else "no higher timeframe"
         return (
-            f"Multi-timeframe {suffix} setup confirmed: {self.config.entry_timeframe} entry aligned with {confirmations}. "
-            f"Integrated confidence={self.format_percent(confidence)}, edge={self.format_percent(edge)}."
+            f"{self.config.entry_timeframe} {suffix} entry confirmed by higher-timeframe direction filter ({confirmations}). "
+            f"Entry confidence={self.format_percent(confidence)}, edge={self.format_percent(edge)}."
         )
 
     @staticmethod

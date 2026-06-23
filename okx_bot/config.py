@@ -205,7 +205,7 @@ class BotConfig:
             risk_per_trade_pct=env_probability("RISK_PER_TRADE_PCT", "0.01"),
             daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
             strategy=normalize_strategy(os.getenv("STRATEGY", "combined")),
-            signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"),
+            signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.68"),
             combined_swing_lookback=env_int("COMBINED_SWING_LOOKBACK", 3),
             combined_structure_lookback=env_int("COMBINED_STRUCTURE_LOOKBACK", 40),
             combined_order_flow_lookback=env_int("COMBINED_ORDER_FLOW_LOOKBACK", 20),
@@ -215,8 +215,8 @@ class BotConfig:
             combined_value_area_pct=env_probability("COMBINED_VALUE_AREA_PCT", "0.70"),
             combined_sweep_tolerance_pct=env_decimal("COMBINED_SWEEP_TOLERANCE_PCT", "0.001"),
             combined_min_displacement_pct=env_decimal("COMBINED_MIN_DISPLACEMENT_PCT", "0.002"),
-            combined_min_score=env_probability("COMBINED_MIN_SCORE", "0.80"),
-            combined_min_edge=env_probability("COMBINED_MIN_EDGE", "0.10"),
+            combined_min_score=env_probability("COMBINED_MIN_SCORE", "0.68"),
+            combined_min_edge=env_probability("COMBINED_MIN_EDGE", "0.12"),
             fast_ema=env_int("FAST_EMA", 9),
             slow_ema=env_int("SLOW_EMA", 21),
             rsi_period=env_int("RSI_PERIOD", 14),
@@ -236,7 +236,7 @@ class BotConfig:
             newsapi_page_size=env_int("NEWSAPI_PAGE_SIZE", 20),
             external_context_lookback_hours=env_int("EXTERNAL_CONTEXT_LOOKBACK_HOURS", 24),
             external_context_cache_seconds=env_int("EXTERNAL_CONTEXT_CACHE_SECONDS", 300),
-            external_context_timeout_seconds=env_int("EXTERNAL_CONTEXT_TIMEOUT_SECONDS", 6),
+            external_context_timeout_seconds=env_int("EXTERNAL_CONTEXT_TIMEOUT_SECONDS", 15),
             external_context_max_confidence_adjustment=env_probability("EXTERNAL_CONTEXT_MAX_CONFIDENCE_ADJUSTMENT", "0.15"),
             external_context_min_support=env_decimal("EXTERNAL_CONTEXT_MIN_SUPPORT", "-0.35"),
             fear_greed_mode=os.getenv("FEAR_GREED_MODE", "momentum").strip().lower(),
@@ -272,7 +272,7 @@ class BotConfig:
                 timeframes.append(timeframe)
         return timeframes
 
-    def validate(self, require_private: bool = False) -> None:
+    def validate(self, require_private: bool = False, require_order_submission: bool = True) -> None:
         if self.market_type != "swap":
             raise ConfigError("This bot is swap-only. Set MARKET_TYPE=swap.")
         if self.margin_mode not in {"isolated", "cross"}:
@@ -371,9 +371,10 @@ class BotConfig:
             raise ConfigError("STOP_LOSS_PCT and TAKE_PROFIT_PCT must be greater than 0.")
         if require_private and not self.has_private_credentials:
             raise ConfigError("Private credentials are required for this command.")
-        if not self.dry_run and not self.has_private_credentials:
-            raise ConfigError("Set OKX_API_KEY, OKX_SECRET_KEY, and OKX_PASSPHRASE before submitting orders.")
-        if not self.dry_run and not self.okx_simulated_trading and not self.enable_live_trading:
-            raise ConfigError(
-                "Live trading is blocked. Set ENABLE_LIVE_TRADING=true only after testing dry-run and demo mode."
-            )
+        if require_order_submission:
+            if not self.dry_run and not self.has_private_credentials:
+                raise ConfigError("Set OKX_API_KEY, OKX_SECRET_KEY, and OKX_PASSPHRASE before submitting orders.")
+            if not self.dry_run and not self.okx_simulated_trading and not self.enable_live_trading:
+                raise ConfigError(
+                    "Live trading is blocked. Set ENABLE_LIVE_TRADING=true only after testing dry-run and demo mode."
+                )

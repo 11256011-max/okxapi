@@ -4,6 +4,7 @@ import argparse
 import logging
 import time
 
+from .backtest import BacktestRunner
 from .bot import TradingBot
 from .config import BotConfig, ConfigError
 
@@ -12,14 +13,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="OKX trading bot")
     parser.add_argument(
         "command",
-        choices=("once", "loop", "balance"),
-        help="Run one strategy pass, run forever, or show balances.",
+        choices=("once", "loop", "balance", "backtest"),
+        help="Run one strategy pass, run forever, show balances, or run a public-OHLCV backtest.",
     )
     parser.add_argument(
         "--log-level",
         default="INFO",
         choices=("DEBUG", "INFO", "WARNING", "ERROR"),
         help="Logging verbosity.",
+    )
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=365,
+        help="Backtest lookback window in days.",
+    )
+    parser.add_argument(
+        "--trades",
+        type=int,
+        default=100,
+        help="Maximum completed backtest trades to report.",
+    )
+    parser.add_argument(
+        "--csv",
+        default="",
+        help="Optional path to write reported backtest trades as CSV.",
     )
     return parser
 
@@ -34,7 +52,15 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         config = BotConfig.from_env()
-        config.validate(require_private=args.command == "balance")
+        config.validate(
+            require_private=args.command == "balance",
+            require_order_submission=args.command != "backtest",
+        )
+
+        if args.command == "backtest":
+            BacktestRunner(config).run(days=args.days, max_trades=args.trades, csv_path=args.csv or None)
+            return 0
+
         bot = TradingBot(config)
 
         if args.command == "balance":
@@ -53,6 +79,9 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except ConfigError as exc:
         logging.error("Config error: %s", exc)
+        return 2
+    except ValueError as exc:
+        logging.error("Input error: %s", exc)
         return 2
     except Exception:
         logging.exception("Bot stopped because of an unexpected error.")
