@@ -45,6 +45,23 @@ class ConfigTests(unittest.TestCase):
             config.validate()
             self.assertEqual(str(config.signal_confidence_threshold), "0.8")
 
+    def test_symbol_confidence_threshold_resolves_base_symbol(self) -> None:
+        env = {
+            "SYMBOL_CONFIDENCE_THRESHOLDS": "BTC:0.72,ETH:0.68",
+        }
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
+            config = BotConfig.from_env()
+            config.validate()
+            self.assertEqual(config.confidence_threshold_for_symbol("BTC/USDT:USDT"), config.symbol_confidence_thresholds["BTC"])
+            self.assertEqual(str(config.confidence_threshold_for_symbol("ETH/USDT:USDT")), "0.68")
+            self.assertEqual(str(config.confidence_threshold_for_symbol("SOL/USDT:USDT")), "0.68")
+
+    def test_backtest_cost_settings_are_validated(self) -> None:
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"BACKTEST_FEE_PCT": "-0.1"}, clear=True):
+            config = BotConfig.from_env()
+            with self.assertRaises(ConfigError):
+                config.validate()
+
     def test_external_context_cache_defaults_to_five_minutes(self) -> None:
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {}, clear=True):
             config = BotConfig.from_env()

@@ -65,11 +65,13 @@ ENTRY_TIMEFRAME=30m
 CONFIRMATION_TIMEFRAMES=1h,4h
 STRATEGY=combined
 SIGNAL_CONFIDENCE_THRESHOLD=0.68
+SYMBOL_CONFIDENCE_THRESHOLDS=BTC:0.72,ETH:0.68,SOL:0.68
 COMBINED_MIN_SCORE=0.68
 COMBINED_MIN_EDGE=0.12
 ```
 
 - `SIGNAL_CONFIDENCE_THRESHOLD`：送出交易前的最低 confidence。
+- `SYMBOL_CONFIDENCE_THRESHOLDS`：分幣種交易門檻；BTC 目前較弱，所以預設提高到 72%，ETH/SOL 維持 68%。
 - `COMBINED_MIN_SCORE`：30m 進場方向分數最低要求。
 - `COMBINED_MIN_EDGE`：多空分數差距最低要求，避免多空太接近時進場。
 
@@ -115,5 +117,18 @@ EXTERNAL_CONTEXT_TIMEOUT_SECONDS=15
 - 使用 `.env` 內 `TAKE_PROFIT_PCT` / `STOP_LOSS_PCT` 模擬出場。
 - 同一根 K 同時碰到止盈與止損時，保守地先算止損。
 - 持倉中若出現反向訊號，以下一根 30m 開盤價平倉。
+
+回測成本假設：
+
+```env
+BACKTEST_FEE_PCT=0.0005
+BACKTEST_SLIPPAGE_PCT=0.0005
+BACKTEST_FUNDING_RATE_8H=0.0001
+```
+
+- `BACKTEST_FEE_PCT`：單邊手續費估算。
+- `BACKTEST_SLIPPAGE_PCT`：單邊滑點估算。
+- `BACKTEST_FUNDING_RATE_8H`：每 8 小時資金費率成本估算。
+- 回測報表會同時顯示 gross PnL、成本與扣成本後的 net PnL。
 
 回測結果是策略研究用途，不代表未來績效。

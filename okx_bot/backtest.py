@@ -28,6 +28,10 @@ class BacktestTrade:
     take_profit_price: Decimal
     stop_loss_price: Decimal
     result: str
+    gross_pnl_pct: Decimal
+    fee_cost_pct: Decimal
+    slippage_cost_pct: Decimal
+    funding_cost_pct: Decimal
     pnl_pct: Decimal
     confidence: Decimal
     reason: str
@@ -76,6 +80,22 @@ class BacktestResult:
             return Decimal("0")
         return sum((trade.pnl_pct for trade in self.trades), Decimal("0")) / Decimal(len(self.trades))
 
+    @property
+    def average_gross_pnl_pct(self) -> Decimal:
+        if not self.trades:
+            return Decimal("0")
+        return sum((trade.gross_pnl_pct for trade in self.trades), Decimal("0")) / Decimal(len(self.trades))
+
+    @property
+    def average_cost_pct(self) -> Decimal:
+        if not self.trades:
+            return Decimal("0")
+        return sum((self.trade_cost_pct(trade) for trade in self.trades), Decimal("0")) / Decimal(len(self.trades))
+
+    @staticmethod
+    def trade_cost_pct(trade: BacktestTrade) -> Decimal:
+        return trade.fee_cost_pct + trade.slippage_cost_pct + trade.funding_cost_pct
+
 
 class BacktestRunner:
     """Public OHLCV strategy replay. This never submits orders."""
@@ -102,14 +122,18 @@ class BacktestRunner:
         all_trades: list[BacktestTrade] = []
 
         logging.info(
-            "Backtest starting: symbols=%s entry=%s confirmations=%s days=%s threshold=%s min_score=%s min_edge=%s",
+            "Backtest starting: symbols=%s entry=%s confirmations=%s days=%s threshold=%s symbol_thresholds=%s min_score=%s min_edge=%s fee=%s slippage=%s funding_8h=%s",
             ",".join(self.config.symbols),
             self.config.entry_timeframe,
             ",".join(self.config.confirmation_timeframes),
             days,
             self.format_percent(self.config.signal_confidence_threshold),
+            self.format_symbol_thresholds(),
             self.format_percent(self.config.combined_min_score),
             self.format_percent(self.config.combined_min_edge),
+            self.format_percent(self.config.backtest_fee_pct),
+            self.format_percent(self.config.backtest_slippage_pct),
+            self.format_percent(self.config.backtest_funding_rate_8h),
         )
 
         for symbol in self.config.symbols:
@@ -198,7 +222,7 @@ class BacktestRunner:
                 continue
 
             signal = self.strategy.generate_multi(candles_by_timeframe)
-            signal = self.apply_signal_confidence_gate(signal)
+            signal = self.apply_signal_confidence_gate(symbol, signal)
 
             if open_trade is not None:
                 if self.is_opposite_signal(open_trade, signal):
@@ -263,7 +287,11 @@ class BacktestRunner:
         exit_price: Decimal,
         result: str,
     ) -> BacktestTrade:
-        pnl_pct = self.pnl_pct(trade.side, trade.entry_price, exit_price)
+        gross_pnl_pct = self.gross_pnl_pct(trade.side, trade.entry_price, exit_price)
+        fee_cost_pct = self.config.backtest_fee_pct * Decimal("2")
+        slippage_cost_pct = self.config.backtest_slippage_pct * Decimal("2")
+        funding_cost_pct = self.funding_cost_pct(trade.entry_time, exit_time)
+        pnl_pct = gross_pnl_pct - fee_cost_pct - slippage_cost_pct - funding_cost_pct
         return BacktestTrade(
             symbol=trade.symbol,
             side=trade.side,
@@ -275,13 +303,18 @@ class BacktestRunner:
             take_profit_price=trade.take_profit_price,
             stop_loss_price=trade.stop_loss_price,
             result=result,
+            gross_pnl_pct=gross_pnl_pct,
+            fee_cost_pct=fee_cost_pct,
+            slippage_cost_pct=slippage_cost_pct,
+            funding_cost_pct=funding_cost_pct,
             pnl_pct=pnl_pct,
             confidence=trade.confidence,
             reason=trade.reason,
         )
 
-    def apply_signal_confidence_gate(self, signal: Signal) -> Signal:
-        if signal.action in {"buy", "sell"} and signal.confidence < self.config.signal_confidence_threshold:
+    def apply_signal_confidence_gate(self, symbol: str, signal: Signal) -> Signal:
+        threshold = self.config.confidence_threshold_for_symbol(symbol)
+        if signal.action in {"buy", "sell"} and signal.confidence < threshold:
             return Signal("hold", signal.reason, signal.price, signal.indicators, signal.confidence)
         return signal
 
@@ -301,10 +334,15 @@ class BacktestRunner:
         )
 
     @staticmethod
-    def pnl_pct(side: str, entry_price: Decimal, exit_price: Decimal) -> Decimal:
+    def gross_pnl_pct(side: str, entry_price: Decimal, exit_price: Decimal) -> Decimal:
         if side == "short":
             return (entry_price - exit_price) / entry_price
         return (exit_price - entry_price) / entry_price
+
+    def funding_cost_pct(self, entry_time: int, exit_time: int) -> Decimal:
+        held_ms = max(0, exit_time - entry_time)
+        intervals = Decimal(held_ms) / Decimal(8 * 60 * 60 * 1000)
+        return self.config.backtest_funding_rate_8h * intervals
 
     def time_frame_seconds(self, timeframe: str) -> int:
         return int(self.exchange.parse_timeframe(timeframe))
@@ -316,12 +354,14 @@ class BacktestRunner:
 
     def log_result(self, result: BacktestResult) -> None:
         logging.info(
-            "Backtest summary: total_completed=%s reported=%s wins=%s losses=%s win_rate=%s average_pnl=%s",
+            "Backtest summary: total_completed=%s reported=%s wins=%s losses=%s win_rate=%s average_gross_pnl=%s average_cost=%s average_net_pnl=%s",
             result.total_completed_trades,
             len(result.trades),
             result.wins,
             result.losses,
             self.format_percent(result.win_rate),
+            self.format_percent(result.average_gross_pnl_pct),
+            self.format_percent(result.average_cost_pct),
             self.format_percent(result.average_pnl_pct),
         )
         for symbol in sorted({trade.symbol for trade in result.trades}):
@@ -329,24 +369,30 @@ class BacktestRunner:
             wins = sum(1 for trade in symbol_trades if trade.won)
             win_rate = Decimal(wins) / Decimal(len(symbol_trades))
             average_pnl = sum((trade.pnl_pct for trade in symbol_trades), Decimal("0")) / Decimal(len(symbol_trades))
+            average_gross = sum((trade.gross_pnl_pct for trade in symbol_trades), Decimal("0")) / Decimal(len(symbol_trades))
+            average_cost = sum((BacktestResult.trade_cost_pct(trade) for trade in symbol_trades), Decimal("0")) / Decimal(len(symbol_trades))
             logging.info(
-                "Backtest symbol summary: %s trades=%s wins=%s losses=%s win_rate=%s average_pnl=%s",
+                "Backtest symbol summary: %s trades=%s wins=%s losses=%s win_rate=%s average_gross_pnl=%s average_cost=%s average_net_pnl=%s",
                 symbol,
                 len(symbol_trades),
                 wins,
                 len(symbol_trades) - wins,
                 self.format_percent(win_rate),
+                self.format_percent(average_gross),
+                self.format_percent(average_cost),
                 self.format_percent(average_pnl),
             )
         for number, trade in enumerate(result.trades, start=1):
             logging.info(
-                "Trade %03d %s %s entry=%s exit=%s result=%s pnl=%s confidence=%s entry_time=%s exit_time=%s",
+                "Trade %03d %s %s entry=%s exit=%s result=%s gross=%s cost=%s net=%s confidence=%s entry_time=%s exit_time=%s",
                 number,
                 trade.symbol,
                 trade.side,
                 trade.entry_price,
                 trade.exit_price,
                 trade.result,
+                self.format_percent(trade.gross_pnl_pct),
+                self.format_percent(BacktestResult.trade_cost_pct(trade)),
                 self.format_percent(trade.pnl_pct),
                 self.format_percent(trade.confidence),
                 self.format_timestamp(trade.entry_time),
@@ -369,6 +415,11 @@ class BacktestRunner:
                     "take_profit_price",
                     "stop_loss_price",
                     "result",
+                    "gross_pnl_pct",
+                    "fee_cost_pct",
+                    "slippage_cost_pct",
+                    "funding_cost_pct",
+                    "total_cost_pct",
                     "pnl_pct",
                     "confidence",
                     "reason",
@@ -387,6 +438,11 @@ class BacktestRunner:
                     "take_profit_price": str(trade.take_profit_price),
                     "stop_loss_price": str(trade.stop_loss_price),
                     "result": trade.result,
+                    "gross_pnl_pct": str(trade.gross_pnl_pct),
+                    "fee_cost_pct": str(trade.fee_cost_pct),
+                    "slippage_cost_pct": str(trade.slippage_cost_pct),
+                    "funding_cost_pct": str(trade.funding_cost_pct),
+                    "total_cost_pct": str(BacktestResult.trade_cost_pct(trade)),
                     "pnl_pct": str(trade.pnl_pct),
                     "confidence": str(trade.confidence),
                     "reason": trade.reason,
@@ -396,6 +452,14 @@ class BacktestRunner:
     @staticmethod
     def format_timestamp(timestamp_ms: int) -> str:
         return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    def format_symbol_thresholds(self) -> str:
+        if not self.config.symbol_confidence_thresholds:
+            return "none"
+        return ",".join(
+            f"{symbol}:{self.format_percent(threshold)}"
+            for symbol, threshold in sorted(self.config.symbol_confidence_thresholds.items())
+        )
 
     @staticmethod
     def format_percent(value: Decimal) -> str:

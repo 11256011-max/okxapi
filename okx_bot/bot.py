@@ -45,7 +45,7 @@ class TradingBot:
 
             signal = self.strategy.generate_multi(candles_by_timeframe)
             signal = self.apply_external_context_filter(symbol, signal)
-            signal = self.apply_signal_confidence_gate(signal)
+            signal = self.apply_signal_confidence_gate(symbol, signal)
             signal = self.apply_position_risk(symbol, signal)
             entry_candles = candles_by_timeframe[self.config.entry_timeframe]
 
@@ -150,17 +150,18 @@ class TradingBot:
         )
         return Signal(signal.action, reason, signal.price, indicators, adjusted_confidence)
 
-    def apply_signal_confidence_gate(self, signal: Signal) -> Signal:
+    def apply_signal_confidence_gate(self, symbol: str, signal: Signal) -> Signal:
         if signal.action not in {"buy", "sell"}:
             return signal
-        if signal.confidence >= self.config.signal_confidence_threshold:
+        threshold = self.config.confidence_threshold_for_symbol(symbol)
+        if signal.confidence >= threshold:
             return signal
 
         indicators = {**signal.indicators, "confidence": float(signal.confidence)}
         reason = (
             f"{signal.action.upper()} signal blocked because confidence "
             f"{self.format_confidence(signal.confidence)} is below threshold "
-            f"{self.format_confidence(self.config.signal_confidence_threshold)}. {signal.reason}"
+            f"{self.format_confidence(threshold)} for {symbol}. {signal.reason}"
         )
         return Signal("hold", reason, signal.price, indicators, signal.confidence)
 

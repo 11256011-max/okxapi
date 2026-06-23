@@ -124,6 +124,7 @@ class BotConfig:
     daily_max_loss_pct: Decimal
     strategy: str
     signal_confidence_threshold: Decimal
+    symbol_confidence_thresholds: dict[str, Decimal]
     combined_swing_lookback: int
     combined_structure_lookback: int
     combined_order_flow_lookback: int
@@ -175,6 +176,9 @@ class BotConfig:
     take_profit_pct: Decimal
     attach_tp_sl: bool
     sell_fraction: Decimal
+    backtest_fee_pct: Decimal
+    backtest_slippage_pct: Decimal
+    backtest_funding_rate_8h: Decimal
     state_file: str
 
     @classmethod
@@ -206,6 +210,7 @@ class BotConfig:
             daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
             strategy=normalize_strategy(os.getenv("STRATEGY", "combined")),
             signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.68"),
+            symbol_confidence_thresholds=env_score_map("SYMBOL_CONFIDENCE_THRESHOLDS"),
             combined_swing_lookback=env_int("COMBINED_SWING_LOOKBACK", 3),
             combined_structure_lookback=env_int("COMBINED_STRUCTURE_LOOKBACK", 40),
             combined_order_flow_lookback=env_int("COMBINED_ORDER_FLOW_LOOKBACK", 20),
@@ -257,6 +262,9 @@ class BotConfig:
             take_profit_pct=env_decimal("TAKE_PROFIT_PCT", "0.04"),
             attach_tp_sl=env_bool("ATTACH_TP_SL", True),
             sell_fraction=env_decimal("SELL_FRACTION", "1"),
+            backtest_fee_pct=env_probability("BACKTEST_FEE_PCT", "0.0005"),
+            backtest_slippage_pct=env_probability("BACKTEST_SLIPPAGE_PCT", "0.0005"),
+            backtest_funding_rate_8h=env_probability("BACKTEST_FUNDING_RATE_8H", "0.0001"),
             state_file=os.getenv("STATE_FILE", "state.json").strip(),
         )
 
@@ -271,6 +279,20 @@ class BotConfig:
             if timeframe and timeframe not in timeframes:
                 timeframes.append(timeframe)
         return timeframes
+
+    def confidence_threshold_for_symbol(self, symbol: str) -> Decimal:
+        for candidate in self.symbol_threshold_candidates(symbol):
+            if candidate in self.symbol_confidence_thresholds:
+                return self.symbol_confidence_thresholds[candidate]
+        return self.signal_confidence_threshold
+
+    @staticmethod
+    def symbol_threshold_candidates(symbol: str) -> list[str]:
+        upper_symbol = symbol.strip().upper()
+        without_settle = upper_symbol.split(":", 1)[0]
+        base = without_settle.split("/", 1)[0]
+        candidates = [upper_symbol, without_settle, base]
+        return [candidate for index, candidate in enumerate(candidates) if candidate and candidate not in candidates[:index]]
 
     def validate(self, require_private: bool = False, require_order_submission: bool = True) -> None:
         if self.market_type != "swap":
@@ -291,6 +313,9 @@ class BotConfig:
             raise ConfigError("CONFIRMATION_TIMEFRAMES must include at least one higher timeframe.")
         if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
             raise ConfigError("SIGNAL_CONFIDENCE_THRESHOLD must be between 0 and 1, or 0 and 100 percent.")
+        for symbol, threshold in self.symbol_confidence_thresholds.items():
+            if not Decimal("0") <= threshold <= Decimal("1"):
+                raise ConfigError(f"SYMBOL_CONFIDENCE_THRESHOLDS for {symbol} must be between 0 and 1, or 0 and 100 percent.")
         if self.combined_swing_lookback < 2:
             raise ConfigError("COMBINED_SWING_LOOKBACK must be at least 2.")
         if self.combined_structure_lookback < 5:
@@ -369,6 +394,8 @@ class BotConfig:
             raise ConfigError("SELL_FRACTION must be between 0 and 1.")
         if self.stop_loss_pct <= 0 or self.take_profit_pct <= 0:
             raise ConfigError("STOP_LOSS_PCT and TAKE_PROFIT_PCT must be greater than 0.")
+        if self.backtest_fee_pct < 0 or self.backtest_slippage_pct < 0 or self.backtest_funding_rate_8h < 0:
+            raise ConfigError("Backtest fee, slippage, and funding settings cannot be negative.")
         if require_private and not self.has_private_credentials:
             raise ConfigError("Private credentials are required for this command.")
         if require_order_submission:

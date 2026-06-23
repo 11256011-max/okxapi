@@ -181,7 +181,7 @@ class BotSignalGateTests(unittest.TestCase):
             Decimal("0.75"),
         )
 
-        gated = TradingBot.apply_signal_confidence_gate(bot_like, signal)
+        gated = TradingBot.apply_signal_confidence_gate(bot_like, "BTC/USDT:USDT", signal)
 
         self.assertEqual(gated.action, "hold")
         self.assertIn("below threshold", gated.reason)
@@ -198,9 +198,30 @@ class BotSignalGateTests(unittest.TestCase):
             Decimal("0.80"),
         )
 
-        gated = TradingBot.apply_signal_confidence_gate(bot_like, signal)
+        gated = TradingBot.apply_signal_confidence_gate(bot_like, "BTC/USDT:USDT", signal)
 
         self.assertEqual(gated.action, "buy")
+
+    def test_symbol_confidence_threshold_can_block_one_market(self) -> None:
+        config = make_config({
+            "SIGNAL_CONFIDENCE_THRESHOLD": "0.68",
+            "SYMBOL_CONFIDENCE_THRESHOLDS": "BTC:0.72,ETH:0.68",
+        })
+        bot_like = object.__new__(TradingBot)
+        bot_like.config = config
+        signal = Signal(
+            "buy",
+            "Test buy signal.",
+            Decimal("100"),
+            {"confidence": 0.70},
+            Decimal("0.70"),
+        )
+
+        btc_signal = TradingBot.apply_signal_confidence_gate(bot_like, "BTC/USDT:USDT", signal)
+        eth_signal = TradingBot.apply_signal_confidence_gate(bot_like, "ETH/USDT:USDT", signal)
+
+        self.assertEqual(btc_signal.action, "hold")
+        self.assertEqual(eth_signal.action, "buy")
 
 
 class BotExternalContextTests(unittest.TestCase):
