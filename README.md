@@ -243,7 +243,6 @@ MARGIN_MODE=isolated
 POSITION_MODE=auto
 RISK_PER_TRADE_PCT=0.01
 DAILY_MAX_LOSS_PCT=0.06
-MAX_LEVERAGE=10
 STOP_LOSS_PCT=0.02
 TAKE_PROFIT_PCT=0.04
 ATTACH_TP_SL=true
@@ -257,7 +256,7 @@ SELL_FRACTION=1
 - `POSITION_MODE`：建議用 `auto`，程式會送單前查 OKX 帳戶是單向 `net` 還是雙向 `hedge`，避免 `Parameter posSide error`。
 - `RISK_PER_TRADE_PCT`：單筆最大風險，`0.01` 代表總權益的 1%。
 - `DAILY_MAX_LOSS_PCT`：日內已實現虧損上限，`0.06` 代表總權益的 6%。
-- `MAX_LEVERAGE`：程式自動計算槓桿後的最高上限。
+- 槓桿由 `RISK_PER_TRADE_PCT`、`STOP_LOSS_PCT`、`ORDER_QUOTE_AMOUNT` 自動反推；專案不再提供手動槓桿上限。
 - `STOP_LOSS_PCT`：停損百分比。
 - `TAKE_PROFIT_PCT`：停利百分比。
 - `ATTACH_TP_SL`：是否在 OKX 掛止盈 / 止損保護單。

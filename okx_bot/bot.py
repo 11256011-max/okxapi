@@ -423,7 +423,7 @@ class TradingBot:
             raise RiskError("Margin budget is zero.")
 
         needed_leverage = self.ceil_decimal(max_notional_by_risk / margin_budget)
-        leverage = max(1, min(self.config.max_leverage, needed_leverage))
+        leverage = max(1, needed_leverage)
         notional = min(max_notional_by_risk, margin_budget * Decimal(leverage))
         amount_contracts = self.contract_amount_from_notional(symbol, notional, entry_price)
         if amount_contracts <= 0:

@@ -121,7 +121,6 @@ def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
         "TAKE_PROFIT_PCT": "0.04",
         "RISK_PER_TRADE_PCT": "0.01",
         "DAILY_MAX_LOSS_PCT": "0.06",
-        "MAX_LEVERAGE": "10",
         "EXTERNAL_CONTEXT_ENABLED": "false",
         "ADD_POSITION_ENABLED": "true",
     }
@@ -241,6 +240,17 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertEqual(plan.margin_budget, Decimal("1000"))
         self.assertEqual(plan.notional, Decimal("5000"))
         self.assertEqual(plan.leverage, 5)
+        self.assertEqual(plan.amount_contracts, Decimal("50"))
+
+    def test_build_swap_position_plan_does_not_cap_leverage_by_config(self) -> None:
+        bot = make_bot({"ORDER_QUOTE_AMOUNT": "10", "MAX_QUOTE_PER_ORDER": "10"})
+
+        plan = bot.build_swap_position_plan("BTC/USDT:USDT", Decimal("100"))
+
+        self.assertEqual(plan.risk_amount, Decimal("100.00"))
+        self.assertEqual(plan.margin_budget, Decimal("10"))
+        self.assertEqual(plan.notional, Decimal("5000"))
+        self.assertEqual(plan.leverage, 500)
         self.assertEqual(plan.amount_contracts, Decimal("50"))
 
     def test_short_exit_prices_reverse_take_profit_and_stop_loss(self) -> None:

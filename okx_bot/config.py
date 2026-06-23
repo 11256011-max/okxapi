@@ -115,7 +115,6 @@ class BotConfig:
     position_mode: str
     risk_per_trade_pct: Decimal
     daily_max_loss_pct: Decimal
-    max_leverage: int
     strategy: str
     signal_confidence_threshold: Decimal
     combined_swing_lookback: int
@@ -195,7 +194,6 @@ class BotConfig:
             position_mode=os.getenv("POSITION_MODE", "auto").strip().lower(),
             risk_per_trade_pct=env_probability("RISK_PER_TRADE_PCT", "0.01"),
             daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
-            max_leverage=env_int("MAX_LEVERAGE", 10),
             strategy=normalize_strategy(os.getenv("STRATEGY", "combined")),
             signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.80"),
             combined_swing_lookback=env_int("COMBINED_SWING_LOOKBACK", 3),
@@ -267,8 +265,6 @@ class BotConfig:
             raise ConfigError("RISK_PER_TRADE_PCT must be between 0 and 1, or 0 and 100 percent.")
         if not Decimal("0") < self.daily_max_loss_pct <= Decimal("1"):
             raise ConfigError("DAILY_MAX_LOSS_PCT must be between 0 and 1, or 0 and 100 percent.")
-        if self.max_leverage < 1:
-            raise ConfigError("MAX_LEVERAGE must be at least 1.")
         if self.strategy != "combined":
             raise ConfigError("STRATEGY must be combined. Legacy ema_rsi/smc values are mapped to combined automatically.")
         if not Decimal("0") <= self.signal_confidence_threshold <= Decimal("1"):
