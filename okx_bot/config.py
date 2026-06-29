@@ -122,6 +122,7 @@ class BotConfig:
     position_mode: str
     risk_per_trade_pct: Decimal
     daily_max_loss_pct: Decimal
+    max_consecutive_daily_losses: int
     strategy: str
     signal_confidence_threshold: Decimal
     long_confidence_threshold: Decimal
@@ -245,6 +246,7 @@ class BotConfig:
             position_mode=os.getenv("POSITION_MODE", "auto").strip().lower(),
             risk_per_trade_pct=env_probability("RISK_PER_TRADE_PCT", "0.01"),
             daily_max_loss_pct=env_probability("DAILY_MAX_LOSS_PCT", "0.06"),
+            max_consecutive_daily_losses=env_int("MAX_CONSECUTIVE_DAILY_LOSSES", 3),
             strategy=normalize_strategy(os.getenv("STRATEGY", "combined")),
             signal_confidence_threshold=env_probability("SIGNAL_CONFIDENCE_THRESHOLD", "0.68"),
             long_confidence_threshold=env_probability("LONG_CONFIDENCE_THRESHOLD", "0.72"),
@@ -399,6 +401,8 @@ class BotConfig:
             raise ConfigError("RISK_PER_TRADE_PCT must be between 0 and 1, or 0 and 100 percent.")
         if not Decimal("0") < self.daily_max_loss_pct <= Decimal("1"):
             raise ConfigError("DAILY_MAX_LOSS_PCT must be between 0 and 1, or 0 and 100 percent.")
+        if self.max_consecutive_daily_losses < 0:
+            raise ConfigError("MAX_CONSECUTIVE_DAILY_LOSSES cannot be negative. Use 0 to disable this guard.")
         if self.strategy != "combined":
             raise ConfigError("STRATEGY must be combined. Legacy ema_rsi/smc values are mapped to combined automatically.")
         if not self.entry_timeframe:

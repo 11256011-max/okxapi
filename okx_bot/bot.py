@@ -430,6 +430,7 @@ class TradingBot:
         exit_plan = build_exit_plan(self.config, symbol, signal.price, position_side, signal, candles)
         risk_multiplier = self.signal_risk_multiplier(signal)
         try:
+            self.assert_loss_streak_limit_not_hit()
             plan = self.build_swap_position_plan(
                 symbol,
                 signal.price,
@@ -674,6 +675,13 @@ class TradingBot:
         if self.state.daily_realized_pnl <= -daily_loss_limit:
             raise RiskError(
                 f"Daily realized loss limit reached: {self.state.daily_realized_pnl} <= -{daily_loss_limit}"
+            )
+
+    def assert_loss_streak_limit_not_hit(self) -> None:
+        max_losses = self.config.max_consecutive_daily_losses
+        if max_losses > 0 and self.state.daily_loss_streak >= max_losses:
+            raise RiskError(
+                f"Daily consecutive loss limit reached: {self.state.daily_loss_streak} >= {max_losses}"
             )
 
     def calculate_swap_pnl(self, symbol: str, amount_contracts: Decimal, exit_price: Decimal) -> Decimal:

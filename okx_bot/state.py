@@ -64,6 +64,7 @@ class BotState:
     day: str = field(default_factory=utc_date)
     daily_notional: Decimal = Decimal("0")
     daily_realized_pnl: Decimal = Decimal("0")
+    daily_loss_streak: int = 0
     positions: dict[str, SymbolPosition] = field(default_factory=dict)
     trades: list[dict[str, Any]] = field(default_factory=list)
     default_symbol: str = "BTC/USDT"
@@ -82,6 +83,7 @@ class BotState:
             day=raw.get("day", utc_date()),
             daily_notional=Decimal(str(raw.get("daily_notional", "0"))),
             daily_realized_pnl=Decimal(str(raw.get("daily_realized_pnl", "0"))),
+            daily_loss_streak=int(raw.get("daily_loss_streak", 0) or 0),
             positions=positions,
             trades=raw.get("trades", []),
             default_symbol=default_symbol,
@@ -115,6 +117,7 @@ class BotState:
                     "day": self.day,
                     "daily_notional": str(self.daily_notional),
                     "daily_realized_pnl": str(self.daily_realized_pnl),
+                    "daily_loss_streak": str(self.daily_loss_streak),
                     "positions": {
                         symbol: position.to_json()
                         for symbol, position in sorted(self.positions.items())
@@ -133,6 +136,7 @@ class BotState:
             self.day = today
             self.daily_notional = Decimal("0")
             self.daily_realized_pnl = Decimal("0")
+            self.daily_loss_streak = 0
 
     def ensure_symbol(self, symbol: str | None) -> SymbolPosition:
         key = symbol or self.default_symbol
@@ -187,6 +191,8 @@ class BotState:
             }
         )
         self.daily_realized_pnl += realized_pnl
+        if reduce_only:
+            self.update_daily_loss_streak(realized_pnl)
 
         if position_side in {"long", "short"} and not reduce_only:
             self.open_position(position, position_side, amount_base, price, stop_loss_price)
@@ -210,6 +216,12 @@ class BotState:
             position.position_base = max(Decimal("0"), position.position_base - amount_base)
             if position.position_base == 0:
                 self.clear_symbol_position(symbol)
+
+    def update_daily_loss_streak(self, realized_pnl: Decimal) -> None:
+        if realized_pnl < 0:
+            self.daily_loss_streak += 1
+            return
+        self.daily_loss_streak = 0
 
     @staticmethod
     def open_position(

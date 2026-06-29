@@ -461,6 +461,64 @@ class BotSwapRiskTests(unittest.TestCase):
         with self.assertRaises(RiskError):
             bot.assert_daily_loss_limit_not_hit(Decimal("10000"))
 
+    def test_consecutive_daily_losses_block_new_positions(self) -> None:
+        bot = make_bot({"MAX_CONSECUTIVE_DAILY_LOSSES": "3"})
+        bot.state.daily_loss_streak = 3
+
+        with self.assertRaises(RiskError):
+            bot.assert_loss_streak_limit_not_hit()
+
+    def test_loss_streak_updates_only_on_closed_trades(self) -> None:
+        state = BotState(default_symbol="BTC/USDT:USDT")
+        state.record_trade(
+            "sell",
+            Decimal("1"),
+            Decimal("99"),
+            Decimal("99"),
+            "dry-run",
+            symbol="BTC/USDT:USDT",
+            position_side="long",
+            reduce_only=True,
+            realized_pnl=Decimal("-1"),
+        )
+        state.record_trade(
+            "sell",
+            Decimal("1"),
+            Decimal("98"),
+            Decimal("98"),
+            "dry-run",
+            symbol="BTC/USDT:USDT",
+            position_side="long",
+            reduce_only=True,
+            realized_pnl=Decimal("-2"),
+        )
+        self.assertEqual(state.daily_loss_streak, 2)
+
+        state.record_trade(
+            "sell",
+            Decimal("1"),
+            Decimal("105"),
+            Decimal("105"),
+            "dry-run",
+            symbol="BTC/USDT:USDT",
+            position_side="long",
+            reduce_only=True,
+            realized_pnl=Decimal("3"),
+        )
+
+        self.assertEqual(state.daily_loss_streak, 0)
+
+    def test_loss_streak_limit_prevents_opening_new_position(self) -> None:
+        bot = make_bot({"MAX_CONSECUTIVE_DAILY_LOSSES": "3"})
+        symbol = "BTC/USDT:USDT"
+        bot.state.daily_loss_streak = 3
+        signal = Signal("sell", "Open short.", Decimal("100"), {}, Decimal("1"))
+
+        bot.sell(symbol, signal)
+
+        self.assertIsNone(bot.state.get_position_side(symbol))
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("0"))
+
     def test_buy_signal_closes_existing_short(self) -> None:
         bot = make_bot()
         symbol = "BTC/USDT:USDT"

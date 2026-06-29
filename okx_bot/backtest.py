@@ -249,17 +249,30 @@ class BacktestRunner:
         }
         trades: list[BacktestTrade] = []
         open_trade: OpenBacktestTrade | None = None
+        active_day = ""
+        daily_realized_pnl = Decimal("0")
+        daily_loss_streak = 0
 
         for index in range(self.config.candle_limit, len(entry_candles) - 1):
             current_candle = entry_candles[index]
             next_candle = entry_candles[index + 1]
             signal_time = current_candle.timestamp + self.timeframe_ms(entry_timeframe)
+            current_day = self.utc_day(signal_time)
+            if current_day != active_day:
+                active_day = current_day
+                daily_realized_pnl = Decimal("0")
+                daily_loss_streak = 0
 
             if open_trade is not None and index >= open_trade.entry_index:
                 recent_candles = entry_candles[max(0, index - self.config.dynamic_exit_atr_period) : index + 1]
                 closed_trade = self.stop_trade_if_hit(open_trade, current_candle, recent_candles)
                 if closed_trade is not None:
                     trades.append(closed_trade)
+                    daily_realized_pnl, daily_loss_streak = self.update_daily_risk_counters(
+                        daily_realized_pnl,
+                        daily_loss_streak,
+                        closed_trade,
+                    )
                     open_trade = None
                     continue
 
@@ -272,11 +285,19 @@ class BacktestRunner:
 
             if open_trade is not None:
                 if self.is_opposite_signal(open_trade, signal):
-                    trades.append(self.close_trade(open_trade, next_candle.timestamp, next_candle.open, "opposite_signal"))
+                    closed_trade = self.close_trade(open_trade, next_candle.timestamp, next_candle.open, "opposite_signal")
+                    trades.append(closed_trade)
+                    daily_realized_pnl, daily_loss_streak = self.update_daily_risk_counters(
+                        daily_realized_pnl,
+                        daily_loss_streak,
+                        closed_trade,
+                    )
                     open_trade = None
                 continue
 
             if signal_time < start_ms or signal.action not in {"buy", "sell"}:
+                continue
+            if self.backtest_daily_entry_blocked(daily_realized_pnl, daily_loss_streak):
                 continue
 
             side = "long" if signal.action == "buy" else "short"
@@ -314,6 +335,24 @@ class BacktestRunner:
             )
 
         return trades
+
+    def backtest_daily_entry_blocked(self, daily_realized_pnl: Decimal, daily_loss_streak: int) -> bool:
+        daily_loss_limit = self.config.backtest_start_equity * self.config.daily_max_loss_pct
+        if daily_realized_pnl <= -daily_loss_limit:
+            return True
+        max_losses = self.config.max_consecutive_daily_losses
+        return max_losses > 0 and daily_loss_streak >= max_losses
+
+    @staticmethod
+    def update_daily_risk_counters(
+        daily_realized_pnl: Decimal,
+        daily_loss_streak: int,
+        trade: BacktestTrade,
+    ) -> tuple[Decimal, int]:
+        daily_realized_pnl += trade.pnl_quote
+        if trade.pnl_quote < 0:
+            return daily_realized_pnl, daily_loss_streak + 1
+        return daily_realized_pnl, 0
 
     def closed_candle_slices(
         self,
@@ -616,6 +655,10 @@ class BacktestRunner:
     @staticmethod
     def format_timestamp(timestamp_ms: int) -> str:
         return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    @staticmethod
+    def utc_day(timestamp_ms: int) -> str:
+        return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).date().isoformat()
 
     def format_symbol_thresholds(self) -> str:
         if not self.config.symbol_confidence_thresholds:

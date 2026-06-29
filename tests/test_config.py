@@ -103,6 +103,7 @@ class ConfigTests(unittest.TestCase):
             "EXIT_PARTIAL_TAKE_PROFIT_R": "3",
             "EXIT_PARTIAL_FRACTION": "0.5",
             "BACKTEST_START_EQUITY": "1000",
+            "MAX_CONSECUTIVE_DAILY_LOSSES": "3",
         }
         with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, env, clear=True):
             config = BotConfig.from_env()
@@ -113,6 +114,13 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(str(config.exit_partial_take_profit_r), "3")
             self.assertEqual(str(config.exit_partial_fraction), "0.5")
             self.assertEqual(str(config.backtest_start_equity), "1000")
+            self.assertEqual(config.max_consecutive_daily_losses, 3)
+
+    def test_negative_consecutive_loss_limit_is_rejected(self) -> None:
+        with patch("okx_bot.config.load_dotenv_if_available"), patch.dict(os.environ, {"MAX_CONSECUTIVE_DAILY_LOSSES": "-1"}, clear=True):
+            config = BotConfig.from_env()
+            with self.assertRaises(ConfigError):
+                config.validate()
 
 
 if __name__ == "__main__":
