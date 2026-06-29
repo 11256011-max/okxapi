@@ -13,8 +13,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="OKX trading bot")
     parser.add_argument(
         "command",
-        choices=("once", "loop", "balance", "backtest"),
-        help="Run one strategy pass, run forever, show balances, or run a public-OHLCV backtest.",
+        choices=("once", "loop", "balance", "backtest", "ui"),
+        help="Run one strategy pass, run forever, show balances, run a public-OHLCV backtest, or open the local UI.",
     )
     parser.add_argument(
         "--log-level",
@@ -39,6 +39,17 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional path to write reported backtest trades as CSV.",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Host for the local UI.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8787,
+        help="Port for the local UI.",
+    )
     return parser
 
 
@@ -54,11 +65,17 @@ def main(argv: list[str] | None = None) -> int:
         config = BotConfig.from_env()
         config.validate(
             require_private=args.command == "balance",
-            require_order_submission=args.command != "backtest",
+            require_order_submission=args.command not in {"backtest", "ui"},
         )
 
         if args.command == "backtest":
             BacktestRunner(config).run(days=args.days, max_trades=args.trades, csv_path=args.csv or None)
+            return 0
+
+        if args.command == "ui":
+            from .ui import run_ui
+
+            run_ui(config, host=args.host, port=args.port)
             return 0
 
         bot = TradingBot(config)
