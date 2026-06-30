@@ -75,6 +75,7 @@ class OpenBacktestTrade:
     partial_exit_price: Decimal | None = None
     breakeven_armed: bool = False
     partial_taken: bool = False
+    trailing_armed: bool = False
 
 
 @dataclass(frozen=True)
@@ -284,7 +285,7 @@ class BacktestRunner:
             signal = self.apply_signal_confidence_gate(symbol, signal)
 
             if open_trade is not None:
-                if self.is_opposite_signal(open_trade, signal):
+                if self.config.exit_close_on_opposite_signal and self.is_opposite_signal(open_trade, signal):
                     closed_trade = self.close_trade(open_trade, next_candle.timestamp, next_candle.open, "opposite_signal")
                     trades.append(closed_trade)
                     daily_realized_pnl, daily_loss_streak = self.update_daily_risk_counters(
@@ -377,11 +378,13 @@ class BacktestRunner:
             if candle.high >= self.price_at_r(trade.side, trade.entry_price, trade.risk_per_unit, self.config.exit_breakeven_r):
                 trade.stop_loss_price = max(trade.stop_loss_price, trade.breakeven_price)
                 trade.breakeven_armed = True
-            if not trade.partial_taken and candle.high >= trade.partial_take_profit_price:
+            if self.config.exit_partial_enabled and not trade.partial_taken and candle.high >= trade.partial_take_profit_price:
                 self.take_partial_profit(trade)
+            if candle.high >= self.price_at_r(trade.side, trade.entry_price, trade.risk_per_unit, self.config.exit_trailing_start_r):
+                trade.trailing_armed = True
             self.update_trailing_stop(trade, recent_candles)
-            if (trade.breakeven_armed or trade.partial_taken) and candle.low <= trade.stop_loss_price:
-                result = "trailing_stop" if trade.partial_taken else "breakeven_stop"
+            if (trade.breakeven_armed or trade.partial_taken or trade.trailing_armed) and candle.low <= trade.stop_loss_price:
+                result = "trailing_stop" if trade.partial_taken or trade.trailing_armed else "breakeven_stop"
                 return self.close_trade(trade, candle.timestamp, trade.stop_loss_price, result)
             return None
 
@@ -391,15 +394,19 @@ class BacktestRunner:
         if candle.low <= self.price_at_r(trade.side, trade.entry_price, trade.risk_per_unit, self.config.exit_breakeven_r):
             trade.stop_loss_price = min(trade.stop_loss_price, trade.breakeven_price)
             trade.breakeven_armed = True
-        if not trade.partial_taken and candle.low <= trade.partial_take_profit_price:
+        if self.config.exit_partial_enabled and not trade.partial_taken and candle.low <= trade.partial_take_profit_price:
             self.take_partial_profit(trade)
+        if candle.low <= self.price_at_r(trade.side, trade.entry_price, trade.risk_per_unit, self.config.exit_trailing_start_r):
+            trade.trailing_armed = True
         self.update_trailing_stop(trade, recent_candles)
-        if (trade.breakeven_armed or trade.partial_taken) and candle.high >= trade.stop_loss_price:
-            result = "trailing_stop" if trade.partial_taken else "breakeven_stop"
+        if (trade.breakeven_armed or trade.partial_taken or trade.trailing_armed) and candle.high >= trade.stop_loss_price:
+            result = "trailing_stop" if trade.partial_taken or trade.trailing_armed else "breakeven_stop"
             return self.close_trade(trade, candle.timestamp, trade.stop_loss_price, result)
         return None
 
     def take_partial_profit(self, trade: OpenBacktestTrade) -> None:
+        if not self.config.exit_partial_enabled:
+            return
         partial_fraction = min(self.config.exit_partial_fraction, trade.remaining_fraction)
         if partial_fraction <= 0:
             return
@@ -408,9 +415,10 @@ class BacktestRunner:
         trade.remaining_fraction -= partial_fraction
         trade.partial_exit_price = trade.partial_take_profit_price
         trade.partial_taken = True
+        trade.trailing_armed = True
 
     def update_trailing_stop(self, trade: OpenBacktestTrade, recent_candles: list[Candle]) -> None:
-        if not self.config.exit_trailing_enabled or not trade.partial_taken or not recent_candles:
+        if not self.config.exit_trailing_enabled or not (trade.partial_taken or trade.trailing_armed) or not recent_candles:
             return
         atr = self.average_true_range(recent_candles)
         if atr <= 0:

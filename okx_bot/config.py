@@ -209,10 +209,13 @@ class BotConfig:
     dynamic_exit_strong_confidence: Decimal
     dynamic_exit_trend_ma_period: int
     exit_breakeven_r: Decimal
+    exit_partial_enabled: bool
     exit_partial_take_profit_r: Decimal
     exit_partial_fraction: Decimal
+    exit_trailing_start_r: Decimal
     exit_trailing_atr_multiplier: Decimal
     exit_trailing_enabled: bool
+    exit_close_on_opposite_signal: bool
     backtest_start_equity: Decimal
     backtest_fee_pct: Decimal
     backtest_slippage_pct: Decimal
@@ -333,10 +336,13 @@ class BotConfig:
             dynamic_exit_strong_confidence=env_probability("DYNAMIC_EXIT_STRONG_CONFIDENCE", "0.70"),
             dynamic_exit_trend_ma_period=env_int("DYNAMIC_EXIT_TREND_MA_PERIOD", 20),
             exit_breakeven_r=env_decimal("EXIT_BREAKEVEN_R", "2.0"),
+            exit_partial_enabled=env_bool("EXIT_PARTIAL_ENABLED", True),
             exit_partial_take_profit_r=env_decimal("EXIT_PARTIAL_TAKE_PROFIT_R", "3.0"),
             exit_partial_fraction=env_probability("EXIT_PARTIAL_FRACTION", "0.5"),
+            exit_trailing_start_r=env_decimal("EXIT_TRAILING_START_R", os.getenv("EXIT_PARTIAL_TAKE_PROFIT_R", "3.0")),
             exit_trailing_atr_multiplier=env_decimal("EXIT_TRAILING_ATR_MULTIPLIER", "1.5"),
             exit_trailing_enabled=env_bool("EXIT_TRAILING_ENABLED", True),
+            exit_close_on_opposite_signal=env_bool("EXIT_CLOSE_ON_OPPOSITE_SIGNAL", True),
             backtest_start_equity=env_decimal("BACKTEST_START_EQUITY", "1000"),
             backtest_fee_pct=env_probability("BACKTEST_FEE_PCT", "0.0005"),
             backtest_slippage_pct=env_probability("BACKTEST_SLIPPAGE_PCT", "0.0005"),
@@ -538,12 +544,15 @@ class BotConfig:
             raise ConfigError("DYNAMIC_EXIT_STRONG_RR must be greater than or equal to DYNAMIC_EXIT_BASE_RR.")
         if not Decimal("0") <= self.dynamic_exit_strong_confidence <= Decimal("1"):
             raise ConfigError("DYNAMIC_EXIT_STRONG_CONFIDENCE must be between 0 and 1, or 0 and 100 percent.")
-        if self.exit_breakeven_r <= 0 or self.exit_partial_take_profit_r <= 0 or self.exit_trailing_atr_multiplier <= 0:
-            raise ConfigError("EXIT_BREAKEVEN_R, EXIT_PARTIAL_TAKE_PROFIT_R, and EXIT_TRAILING_ATR_MULTIPLIER must be greater than 0.")
+        if self.exit_breakeven_r <= 0 or self.exit_partial_take_profit_r <= 0 or self.exit_trailing_start_r <= 0 or self.exit_trailing_atr_multiplier <= 0:
+            raise ConfigError("EXIT_BREAKEVEN_R, EXIT_PARTIAL_TAKE_PROFIT_R, EXIT_TRAILING_START_R, and EXIT_TRAILING_ATR_MULTIPLIER must be greater than 0.")
         if self.exit_partial_take_profit_r < self.exit_breakeven_r:
             raise ConfigError("EXIT_PARTIAL_TAKE_PROFIT_R must be greater than or equal to EXIT_BREAKEVEN_R.")
-        if not Decimal("0") < self.exit_partial_fraction < Decimal("1"):
-            raise ConfigError("EXIT_PARTIAL_FRACTION must be greater than 0 and less than 1.")
+        if self.exit_partial_enabled:
+            if not Decimal("0") < self.exit_partial_fraction < Decimal("1"):
+                raise ConfigError("EXIT_PARTIAL_FRACTION must be greater than 0 and less than 1 when EXIT_PARTIAL_ENABLED=true.")
+        elif not Decimal("0") <= self.exit_partial_fraction < Decimal("1"):
+            raise ConfigError("EXIT_PARTIAL_FRACTION must be between 0 and less than 1 when EXIT_PARTIAL_ENABLED=false.")
         if self.backtest_start_equity <= 0:
             raise ConfigError("BACKTEST_START_EQUITY must be greater than 0.")
         if require_private and not self.has_private_credentials:

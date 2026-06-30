@@ -112,7 +112,7 @@ class TradingBot:
         if self.position_stop_hit(position, latest):
             close_price = position.stop_loss_price
             reason = "dynamic stop loss"
-            if position.partial_taken:
+            if position.trailing_armed or position.partial_taken:
                 reason = "dynamic trailing stop"
             elif position.breakeven_armed:
                 reason = "dynamic breakeven stop"
@@ -122,10 +122,15 @@ class TradingBot:
             self.arm_breakeven_stop(symbol, position)
 
         position_changed = False
-        if not position.partial_taken and self.position_reached_r(position, latest, self.config.exit_partial_take_profit_r):
+        if (
+            self.config.exit_partial_enabled
+            and not position.partial_taken
+            and self.position_reached_r(position, latest, self.config.exit_partial_take_profit_r)
+        ):
             partial_price = self.price_at_r(position.side, position.entry_price, position.risk_per_unit, self.config.exit_partial_take_profit_r)
             if self.close_swap_position_fraction(symbol, partial_price, self.config.exit_partial_fraction, "dynamic partial take profit"):
                 position.partial_taken = True
+                position.trailing_armed = True
                 self.arm_breakeven_stop(symbol, position)
                 logging.info(
                     "Dynamic partial take profit completed for %s %s at %s; remaining contracts=%s.",
@@ -135,6 +140,9 @@ class TradingBot:
                     position.position_base,
                 )
                 position_changed = True
+
+        if self.position_reached_r(position, latest, self.config.exit_trailing_start_r):
+            self.arm_trailing_stop(symbol, position)
 
         self.update_trailing_stop(symbol, position, candles)
         if self.position_stop_hit(position, latest):
@@ -185,8 +193,14 @@ class TradingBot:
         position.stop_loss_price = new_stop
         position.breakeven_armed = True
 
+    @staticmethod
+    def arm_trailing_stop(symbol: str, position: Any) -> None:
+        if not position.trailing_armed:
+            logging.info("Dynamic exit armed %s %s trailing stop.", symbol, position.side)
+        position.trailing_armed = True
+
     def update_trailing_stop(self, symbol: str, position: Any, candles: list[Candle]) -> None:
-        if not self.config.exit_trailing_enabled or not position.partial_taken:
+        if not self.config.exit_trailing_enabled or not (position.trailing_armed or position.partial_taken):
             return
         atr = self.average_true_range(candles[-(self.config.dynamic_exit_atr_period + 1) :])
         if atr <= 0:
@@ -321,6 +335,9 @@ class TradingBot:
     def buy_swap(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
         position_side = self.state.get_position_side(symbol)
         if position_side == "short":
+            if not self.config.exit_close_on_opposite_signal:
+                logging.info("Buy signal ignored for %s because EXIT_CLOSE_ON_OPPOSITE_SIGNAL=false and a short is open.", symbol)
+                return
             self.close_swap_position(symbol, signal, order_side="buy")
             return
         if position_side == "long":
@@ -331,6 +348,9 @@ class TradingBot:
     def sell_swap(self, symbol: str, signal: Signal, candles: list[Candle] | None = None) -> None:
         position_side = self.state.get_position_side(symbol)
         if position_side == "long":
+            if not self.config.exit_close_on_opposite_signal:
+                logging.info("Sell signal ignored for %s because EXIT_CLOSE_ON_OPPOSITE_SIGNAL=false and a long is open.", symbol)
+                return
             self.close_swap_position(symbol, signal, order_side="sell")
             return
         if position_side == "short":

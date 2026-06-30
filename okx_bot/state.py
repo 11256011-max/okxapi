@@ -25,6 +25,7 @@ class SymbolPosition:
     lowest_price: Decimal = Decimal("0")
     breakeven_armed: bool = False
     partial_taken: bool = False
+    trailing_armed: bool = False
 
     @classmethod
     def from_raw(cls, raw: dict[str, Any] | None) -> "SymbolPosition":
@@ -41,6 +42,7 @@ class SymbolPosition:
             lowest_price=Decimal(str(raw.get("lowest_price", "0"))),
             breakeven_armed=bool(raw.get("breakeven_armed", False)),
             partial_taken=bool(raw.get("partial_taken", False)),
+            trailing_armed=bool(raw.get("trailing_armed", raw.get("partial_taken", False))),
         )
 
     def to_json(self) -> dict[str, str | bool | None]:
@@ -56,6 +58,7 @@ class SymbolPosition:
             "lowest_price": str(self.lowest_price),
             "breakeven_armed": self.breakeven_armed,
             "partial_taken": self.partial_taken,
+            "trailing_armed": self.trailing_armed,
         }
 
 
@@ -254,6 +257,7 @@ class BotState:
             position.lowest_price = price
             position.breakeven_armed = False
             position.partial_taken = False
+            position.trailing_armed = False
         else:
             position.highest_price = max(position.highest_price, price)
             position.lowest_price = min(position.lowest_price, price) if position.lowest_price > 0 else price
@@ -271,3 +275,4 @@ class BotState:
         position.lowest_price = Decimal("0")
         position.breakeven_armed = False
         position.partial_taken = False
+        position.trailing_armed = False

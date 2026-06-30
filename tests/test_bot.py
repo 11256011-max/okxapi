@@ -597,6 +597,54 @@ class BotSwapRiskTests(unittest.TestCase):
         self.assertTrue(position.breakeven_armed)
         self.assertEqual(position.stop_loss_price, Decimal("100"))
 
+    def test_dynamic_exit_can_disable_three_r_partial_profit(self) -> None:
+        bot = make_bot({
+            "EXIT_PARTIAL_ENABLED": "false",
+            "EXIT_PARTIAL_FRACTION": "0",
+            "EXIT_TRAILING_START_R": "4",
+        })
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade(
+            "buy",
+            Decimal("2"),
+            Decimal("100"),
+            Decimal("200"),
+            "dry-run",
+            symbol=symbol,
+            position_side="long",
+            stop_loss_price=Decimal("98"),
+        )
+
+        changed = bot.manage_open_position(symbol, [candle(1, "100", "106.5", "104", "105")])
+
+        self.assertFalse(changed)
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("2"))
+        position = bot.state.ensure_symbol(symbol)
+        self.assertFalse(position.partial_taken)
+        self.assertFalse(position.trailing_armed)
+        self.assertTrue(position.breakeven_armed)
+        self.assertEqual(position.stop_loss_price, Decimal("100"))
+
+    def test_dynamic_exit_can_ignore_opposite_signal_to_hold_longer(self) -> None:
+        bot = make_bot({"EXIT_CLOSE_ON_OPPOSITE_SIGNAL": "false"})
+        symbol = "BTC/USDT:USDT"
+        bot.state.record_trade(
+            "buy",
+            Decimal("2"),
+            Decimal("100"),
+            Decimal("200"),
+            "dry-run",
+            symbol=symbol,
+            position_side="long",
+            stop_loss_price=Decimal("98"),
+        )
+        signal = Signal("sell", "Opposite short.", Decimal("95"), {}, Decimal("1"))
+
+        bot.sell(symbol, signal)
+
+        self.assertEqual(bot.state.get_position_side(symbol), "long")
+        self.assertEqual(bot.state.get_position_base(symbol), Decimal("2"))
+
     def test_dynamic_exit_closes_at_breakeven_after_two_r_reversal(self) -> None:
         bot = make_bot()
         symbol = "BTC/USDT:USDT"

@@ -100,8 +100,11 @@ class ConfigTests(unittest.TestCase):
             "LAYERED_ENTRY_PULLBACK_TOLERANCE_PCT": "0.003",
             "LAYERED_ENTRY_MAX_CHASE_PCT": "0.006",
             "EXIT_BREAKEVEN_R": "2",
+            "EXIT_PARTIAL_ENABLED": "false",
             "EXIT_PARTIAL_TAKE_PROFIT_R": "3",
-            "EXIT_PARTIAL_FRACTION": "0.5",
+            "EXIT_PARTIAL_FRACTION": "0",
+            "EXIT_TRAILING_START_R": "4",
+            "EXIT_CLOSE_ON_OPPOSITE_SIGNAL": "false",
             "BACKTEST_START_EQUITY": "1000",
             "MAX_CONSECUTIVE_DAILY_LOSSES": "3",
         }
@@ -111,8 +114,11 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(config.symbols, ["ETH/USDT:USDT", "SOL/USDT:USDT"])
             self.assertTrue(config.layered_entry_require_pullback)
             self.assertEqual(str(config.exit_breakeven_r), "2")
+            self.assertFalse(config.exit_partial_enabled)
             self.assertEqual(str(config.exit_partial_take_profit_r), "3")
-            self.assertEqual(str(config.exit_partial_fraction), "0.5")
+            self.assertEqual(str(config.exit_partial_fraction), "0")
+            self.assertEqual(str(config.exit_trailing_start_r), "4")
+            self.assertFalse(config.exit_close_on_opposite_signal)
             self.assertEqual(str(config.backtest_start_equity), "1000")
             self.assertEqual(config.max_consecutive_daily_losses, 3)
 

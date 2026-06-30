@@ -123,9 +123,12 @@ def config_snapshot(config: BotConfig) -> dict[str, Any]:
         "combined_min_score": decimal_string(config.combined_min_score),
         "combined_min_edge": decimal_string(config.combined_min_edge),
         "exit_breakeven_r": decimal_string(config.exit_breakeven_r),
+        "exit_partial_enabled": config.exit_partial_enabled,
         "exit_partial_take_profit_r": decimal_string(config.exit_partial_take_profit_r),
         "exit_partial_fraction": decimal_string(config.exit_partial_fraction),
+        "exit_trailing_start_r": decimal_string(config.exit_trailing_start_r),
         "exit_trailing_atr_multiplier": decimal_string(config.exit_trailing_atr_multiplier),
+        "exit_close_on_opposite_signal": config.exit_close_on_opposite_signal,
     }
 
 
@@ -228,9 +231,12 @@ def risk_snapshot(config: BotConfig, bot: TradingBot) -> dict[str, Any]:
         "daily_loss_streak": bot.state.daily_loss_streak,
         "dynamic_exit": {
             "breakeven_r": decimal_string(config.exit_breakeven_r),
+            "partial_enabled": config.exit_partial_enabled,
             "partial_take_profit_r": decimal_string(config.exit_partial_take_profit_r),
             "partial_fraction": percent_string(config.exit_partial_fraction),
+            "trailing_start_r": decimal_string(config.exit_trailing_start_r),
             "trailing_atr_multiplier": decimal_string(config.exit_trailing_atr_multiplier),
+            "close_on_opposite_signal": config.exit_close_on_opposite_signal,
         },
     }
 
@@ -759,6 +765,14 @@ INDEX_HTML = r"""<!doctype html>
         metric("今日已實現", `${num(data.risk.daily_realized_pnl, 4)}U`),
         metric("動態出場", `${data.risk.dynamic_exit.breakeven_r}R / ${data.risk.dynamic_exit.partial_take_profit_r}R`)
       ].join("");
+
+      const exit = data.risk.dynamic_exit;
+      el("riskGrid").insertAdjacentHTML("beforeend", [
+        metric("Partial TP", exit.partial_enabled ? `${exit.partial_take_profit_r}R / ${exit.partial_fraction}` : "OFF"),
+        metric("Trailing start", `${exit.trailing_start_r}R`),
+        metric("Trailing ATR", `${exit.trailing_atr_multiplier}x`),
+        metric("Opposite signal", exit.close_on_opposite_signal ? "CLOSE" : "IGNORE")
+      ].join(""));
 
       const ctx = data.external_context;
       el("contextGrid").innerHTML = [
