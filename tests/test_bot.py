@@ -3,11 +3,10 @@ import os
 import unittest
 from unittest.mock import patch
 
-from okx_bot.bot import TradingBot
+from okx_bot.bot import RiskError, TradingBot
 from okx_bot.config import BotConfig
 from okx_bot.external_context import ContextSnapshot
 from okx_bot.models import Candle, Signal
-from okx_bot.risk import RiskError
 from okx_bot.state import BotState
 
 

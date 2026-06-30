@@ -24,7 +24,6 @@ def make_config(extra_env: dict[str, str] | None = None) -> BotConfig:
     env = {
         "SYMBOL_STOP_LOSS_PCTS": "ETH:0.015",
         "SYMBOL_TAKE_PROFIT_PCTS": "ETH:0.06",
-        "DYNAMIC_EXIT_ENABLED": "true",
         "DYNAMIC_EXIT_MIN_STOP_PCT": "0.012",
         "DYNAMIC_EXIT_MAX_STOP_PCT": "0.030",
         "DYNAMIC_EXIT_STRONG_CONFIDENCE": "0.70",

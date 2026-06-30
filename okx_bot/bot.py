@@ -10,9 +10,12 @@ from .exchange import create_exchange
 from .exit_plan import build_exit_plan
 from .external_context import ExternalContextService
 from .models import Candle, Signal
-from .risk import RiskError, RiskManager
 from .state import BotState
 from .strategy import create_strategy
+
+
+class RiskError(RuntimeError):
+    """Raised when a trade violates a configured risk rule."""
 
 
 @dataclass(frozen=True)
@@ -30,7 +33,6 @@ class TradingBot:
         self.config = config
         self.exchange = create_exchange(config)
         self.strategy = create_strategy(config)
-        self.risk = RiskManager(config)
         self.external_context = ExternalContextService(config) if config.external_context_enabled else None
         self.state = BotState.load(config.state_file, default_symbol=self.config.symbols[0])
         self._effective_position_mode: str | None = None
@@ -51,7 +53,6 @@ class TradingBot:
             signal = self.strategy.generate_multi(candles_by_timeframe)
             signal = self.apply_external_context_filter(symbol, signal)
             signal = self.apply_signal_confidence_gate(symbol, signal)
-            signal = self.apply_position_risk(symbol, signal)
 
             logging.info(
                 "Symbol=%s Signal=%s confidence=%s price=%s reason=%s indicators=%s",
@@ -96,7 +97,7 @@ class TradingBot:
         return candles
 
     def manage_open_position(self, symbol: str, candles: list[Candle]) -> bool:
-        if not candles or not self.config.dynamic_exit_enabled:
+        if not candles:
             return False
         position = self.state.ensure_symbol(symbol)
         if position.position_base <= 0 or position.side not in {"long", "short"}:
@@ -216,17 +217,6 @@ class TradingBot:
         if candidate > position.stop_loss_price:
             logging.info("Dynamic trailing stop moved %s long stop from %s to %s.", symbol, position.stop_loss_price, candidate)
             position.stop_loss_price = candidate
-
-    def apply_position_risk(self, symbol: str, signal: Signal) -> Signal:
-        if self.config.dynamic_exit_enabled:
-            return signal
-        if self.config.attach_tp_sl and not self.config.dry_run:
-            return signal
-        if self.risk.stop_loss_hit(self.state, symbol, signal.price):
-            return Signal(self.close_action_for_symbol(symbol), "Stop loss hit.", signal.price, signal.indicators, Decimal("1"))
-        if self.risk.take_profit_hit(self.state, symbol, signal.price):
-            return Signal(self.close_action_for_symbol(symbol), "Take profit hit.", signal.price, signal.indicators, Decimal("1"))
-        return signal
 
     def apply_external_context_filter(self, symbol: str, signal: Signal) -> Signal:
         if self.external_context is None:
@@ -459,7 +449,7 @@ class TradingBot:
             )
             self.assert_daily_loss_limit_not_hit(plan.equity)
         except RiskError as exc:
-            logging.warning("Swap %s blocked by risk manager: %s", order_side, exc)
+            logging.warning("Swap %s blocked by risk controls: %s", order_side, exc)
             return
 
         if self.config.dry_run:
@@ -493,14 +483,13 @@ class TradingBot:
         self.assert_order_submission_allowed()
         try:
             self.set_swap_leverage(symbol, plan.leverage, position_side)
-            attached_take_profit = None if self.config.dynamic_exit_enabled else exit_plan.take_profit_price
             order = self.create_swap_market_order_with_tp_sl(
                 symbol,
                 plan.amount_contracts,
                 signal.price,
                 order_side=order_side,
                 position_side=position_side,
-                take_profit_price=attached_take_profit,
+                take_profit_price=None,
                 stop_loss_price=exit_plan.stop_loss_price,
             )
         except Exception as exc:
@@ -520,8 +509,7 @@ class TradingBot:
             position_side=position_side,
             stop_loss_price=exit_plan.stop_loss_price,
         )
-        exit_mode = "attached SL and dynamic exit management" if self.config.dynamic_exit_enabled else "attached TP/SL"
-        logging.info("Swap %s %s submitted with %s: %s", action_label, position_side, exit_mode, order)
+        logging.info("Swap %s %s submitted with attached SL and dynamic exit management: %s", action_label, position_side, order)
 
     def close_swap_position(self, symbol: str, signal: Signal, order_side: str) -> None:
         self.close_swap_position_fraction(symbol, signal.price, self.config.sell_fraction, f"{signal.reason} close")

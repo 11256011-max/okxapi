@@ -27,7 +27,7 @@ def build_exit_plan(
 ) -> ExitPlan:
     fixed_stop_pct = config.stop_loss_pct_for_symbol(symbol)
     fixed_take_profit_pct = config.take_profit_pct_for_symbol(symbol)
-    if not config.dynamic_exit_enabled or not candles or not dynamic_exit_enabled_for_symbol(config, symbol):
+    if not candles or not symbol_uses_dynamic_exit(config, symbol):
         return plan_from_percentages(entry_price, position_side, fixed_stop_pct, fixed_take_profit_pct, dynamic=False)
 
     if not is_strong_trend(config, position_side, signal, candles):
@@ -70,7 +70,7 @@ def plan_from_percentages(
     )
 
 
-def dynamic_exit_enabled_for_symbol(config: BotConfig, symbol: str) -> bool:
+def symbol_uses_dynamic_exit(config: BotConfig, symbol: str) -> bool:
     if not config.dynamic_exit_symbols:
         return True
     enabled_symbols = {item.strip().upper() for item in config.dynamic_exit_symbols}

@@ -153,16 +153,6 @@ class BotConfig:
     combined_min_displacement_pct: Decimal
     combined_min_score: Decimal
     combined_min_edge: Decimal
-    fast_ema: int
-    slow_ema: int
-    rsi_period: int
-    rsi_buy_max: Decimal
-    rsi_sell_min: Decimal
-    smc_swing_lookback: int
-    smc_zone_lookback: int
-    smc_zone_tolerance_pct: Decimal
-    smc_min_displacement_pct: Decimal
-    smc_require_fvg: bool
     external_context_enabled: bool
     newsapi_enabled: bool
     gdelt_enabled: bool
@@ -197,7 +187,6 @@ class BotConfig:
     symbol_take_profit_pcts: dict[str, Decimal]
     attach_tp_sl: bool
     sell_fraction: Decimal
-    dynamic_exit_enabled: bool
     dynamic_exit_symbols: list[str]
     dynamic_exit_atr_period: int
     dynamic_exit_structure_lookback: int
@@ -280,16 +269,6 @@ class BotConfig:
             combined_min_displacement_pct=env_decimal("COMBINED_MIN_DISPLACEMENT_PCT", "0.002"),
             combined_min_score=env_probability("COMBINED_MIN_SCORE", "0.68"),
             combined_min_edge=env_probability("COMBINED_MIN_EDGE", "0.12"),
-            fast_ema=env_int("FAST_EMA", 9),
-            slow_ema=env_int("SLOW_EMA", 21),
-            rsi_period=env_int("RSI_PERIOD", 14),
-            rsi_buy_max=env_decimal("RSI_BUY_MAX", "65"),
-            rsi_sell_min=env_decimal("RSI_SELL_MIN", "70"),
-            smc_swing_lookback=env_int("SMC_SWING_LOOKBACK", 3),
-            smc_zone_lookback=env_int("SMC_ZONE_LOOKBACK", 40),
-            smc_zone_tolerance_pct=env_decimal("SMC_ZONE_TOLERANCE_PCT", "0.003"),
-            smc_min_displacement_pct=env_decimal("SMC_MIN_DISPLACEMENT_PCT", "0.002"),
-            smc_require_fvg=env_bool("SMC_REQUIRE_FVG", False),
             external_context_enabled=env_bool("EXTERNAL_CONTEXT_ENABLED", True),
             newsapi_enabled=env_bool("NEWSAPI_ENABLED", True),
             gdelt_enabled=env_bool("GDELT_ENABLED", True),
@@ -324,7 +303,6 @@ class BotConfig:
             symbol_take_profit_pcts=env_score_map("SYMBOL_TAKE_PROFIT_PCTS"),
             attach_tp_sl=env_bool("ATTACH_TP_SL", True),
             sell_fraction=env_decimal("SELL_FRACTION", "1"),
-            dynamic_exit_enabled=env_bool("DYNAMIC_EXIT_ENABLED", True),
             dynamic_exit_symbols=env_list("DYNAMIC_EXIT_SYMBOLS", "ETH,SOL"),
             dynamic_exit_atr_period=env_int("DYNAMIC_EXIT_ATR_PERIOD", 14),
             dynamic_exit_structure_lookback=env_int("DYNAMIC_EXIT_STRUCTURE_LOOKBACK", 20),

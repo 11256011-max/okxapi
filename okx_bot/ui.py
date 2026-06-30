@@ -89,7 +89,6 @@ def build_snapshot(config: BotConfig) -> dict[str, Any]:
     strategy_signal = bot.strategy.generate_multi(candles_by_timeframe)
     context_signal = bot.apply_external_context_filter(symbol, strategy_signal)
     final_signal = bot.apply_signal_confidence_gate(symbol, context_signal)
-    final_signal = bot.apply_position_risk(symbol, final_signal)
     threshold = config.confidence_threshold_for_symbol_and_action(symbol, context_signal.action)
 
     return {
