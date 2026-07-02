@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import re
 import time
+
+from ccxt.base.errors import AuthenticationError, PermissionDenied
 
 from .backtest import BacktestRunner
 from .bot import TradingBot
 from .config import BotConfig, ConfigError
+
+OKX_AUTH_ERRORS = (AuthenticationError, PermissionDenied)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -51,6 +57,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Port for the local UI.",
     )
     return parser
+
+
+def concise_okx_error_message(exc: Exception) -> str:
+    message = str(exc)
+    match = re.search(r"(\{.*\})", message)
+    if not match:
+        return message
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return message
+    okx_message = payload.get("msg")
+    okx_code = payload.get("code")
+    if okx_message and okx_code:
+        return f"OKX code {okx_code}: {okx_message}"
+    if okx_message:
+        return str(okx_message)
+    return message
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -99,6 +123,13 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except ValueError as exc:
         logging.error("Input error: %s", exc)
+        return 2
+    except OKX_AUTH_ERRORS as exc:
+        logging.error("OKX API permission/authentication error: %s", concise_okx_error_message(exc))
+        logging.error(
+            "If this mentions IP whitelist, add this machine's current public IP to the OKX API key whitelist. "
+            "If it mentions environment mismatch, use demo keys with OKX_SIMULATED_TRADING=true or live keys with it=false."
+        )
         return 2
     except Exception:
         logging.exception("Bot stopped because of an unexpected error.")
